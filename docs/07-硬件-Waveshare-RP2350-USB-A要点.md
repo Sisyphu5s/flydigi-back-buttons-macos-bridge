@@ -1,6 +1,6 @@
 # 07 硬件：Waveshare RP2350-USB-A 的坑与用法
 
-适用前提：**目标平台已收窄为 macOS-only（决策 D1 修订）**，板子按 **Waveshare RP2350(-USB-A)** 记。
+适用前提：**目标平台以 macOS 为主，另有 iPad 用户实测可用**；板子按 **Waveshare RP2350(-USB-A)** 记。iPad 供电、热插拔、睡眠唤醒和长期稳定性仍属风险项，见 docs/06 的 R11、R16、R17。
 
 ---
 

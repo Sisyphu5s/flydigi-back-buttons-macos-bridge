@@ -1,14 +1,20 @@
-# flydigi-elite-bridge — 飞智 Vader 5 Pro → macOS 背键桥接
+# flydigi-back-buttons-macos-bridge — 飞智背键 → macOS 桥接
 
-这是一个面向 **macOS** 的实验性 USB 协议桥：Waveshare RP2350 通过 USB-A/PIO-USB 读取飞智 Vader 5 Pro 接收器，再通过 USB-C 暴露一个可被 macOS `GameController` 接受的 HID 手柄，同时保留 M1–M4、传感器、配置和震动通道。
+这是一个把**飞智 Vader 5 Pro 背键桥接到 macOS**的实验性 USB 协议桥：Waveshare RP2350 通过 USB-A/PIO-USB 读取接收器，再通过 USB-C 暴露一个可被 macOS `GameController` 接受的 HID 手柄，同时保留 M1–M4、传感器、配置和震动通道。当前也有用户实测在 iPad 上可用，但 iPad 的机型、iPadOS 版本、供电条件和具体应用覆盖仍不完整。
 
-> **公开发布说明**：本项目适合熟悉 RP2350、USB HID 和 macOS 调试工具的开发者。它不是飞智、Apple、Microsoft 或 Waveshare 的官方软件，也不保证在其他 macOS 版本、iOS/iPadOS、Windows、Linux、浏览器或游戏中具有相同表现。使用前请阅读 [`DISCLAIMER.md`](DISCLAIMER.md) 和 [`NOTICE.md`](NOTICE.md)。
+> **公开发布说明**：本项目适合熟悉 RP2350、USB HID 和 macOS/iPadOS 调试工具的开发者。它不是飞智、Apple、Microsoft 或 Waveshare 的官方软件，也不保证在其他 macOS/iPadOS 版本、Windows、Linux、浏览器或游戏中具有相同表现。使用前请阅读 [`DISCLAIMER.md`](DISCLAIMER.md)、[`NOTICE.md`](NOTICE.md) 和 [`ACKNOWLEDGMENTS.md`](ACKNOWLEDGMENTS.md)。
 
 工作区：本仓库根目录
 目标硬件：**Waveshare RP2350（USB-A 走 PIO 做 host + USB-C 做 device）**
-目标平台：**仅 macOS**（2026-09-28 修订：iPhone/iPad 暂缓）
-状态：**已完成一次可复现的 macOS 真机验证**（Apple 兼容混合身份已触发 `GCControllerDidConnect`；WebHID 电量、传感器和震动路径已验证；实体按键与摇杆仍建议按目标硬件逐项回归）
+目标平台：**macOS，另有 iPad 用户实测可用**（并非所有 iPad 配置均已覆盖）
+状态：**macOS 真机验证完成，iPad 已有成功使用记录**（Apple 兼容混合身份已触发 `GCControllerDidConnect`；WebHID 电量、传感器和震动路径已验证；实体按键、摇杆、iPad 供电和长期稳定性仍建议逐项回归）
 最后更新：2026-09-30
+
+## 平台实测与未知后果
+
+- macOS：已验证 Apple 兼容 HID 身份、`GCController` 连接、26 个 HID 按键、轴、WebHID 电量/传感器和震动 OUT。
+- iPad：用户已实测桥接手柄可以使用。当前没有记录完整的 iPad 型号、iPadOS 版本、连接拓扑、运行的 App、睡眠唤醒和长时间运行结果，因此这条证据只说明“至少一个实际组合可用”，不能外推到全部 iPad。
+- 不良后果：目前**没有足够证据排除** USB 供电不足、接收器掉线、睡眠唤醒后需要重插、系统更新后不再匹配、应用读取不到 M1–M4、震动过强、报告冲突或其他暂未观察到的副作用。请把首次 iPad 测试当作实验，保留可回滚的 Flash 备份，并记录设备与系统版本。
 
 ## 快速开始
 
@@ -35,7 +41,7 @@ python3 firmware/rp2350/test/usb_desc_check.py --generic-apple \
 
 公开 Release 会附带经过本机 `picotool` 写入和校验的 Apple 兼容 UF2。预编译文件只适用于文档中列出的 RP2350 配置；刷写前仍须保存整片 Flash，并阅读 [`DISCLAIMER.md`](DISCLAIMER.md)。
 
-下载入口：<https://github.com/Sisyphu5s/flydigi-elite-bridge/releases/latest>
+下载入口：<https://github.com/Sisyphu5s/flydigi-back-buttons-macos-bridge/releases/latest>
 
 ### 刷写
 
@@ -112,7 +118,7 @@ node ../web/gamepad-probe.test.js
 
 | # | 项 | 结论 | 对计划的直接影响 |
 |---|---|---|---|
-| D1 | 目标设备 | **仅 macOS**（修订：iPhone/iPad 暂缓） | 验证手段齐全（ioreg / hidutil / GC API / 本机反汇编）；iOS 证据存档 docs/01 §6 |
+| D1 | 目标设备 | **macOS 为主，iPad 已有用户实测可用** | macOS 有 ioreg / hidutil / GC API / 本机反汇编证据；iPad 目前只有成功使用记录，机型、系统版本、App 和长期副作用仍待补全 |
 | D2 | 拨片 | **必须：M1–M4 做成 4 个独立输入**（需求不变） | 交付标准 = "设备侧提供框架认的元素标识符"。载体已确定可为 **`BUTTON_M1..M4`**（走 HID 模型路线），`XBOX_BUTTON_PADDLE_1..4` 仅剩备选意义（docs/10 §7、docs/11 §4） |
 | D3 | 硬件 | **Waveshare RP2350**（USB-A=PIO host、USB-C=device） | 板级要点见 docs/07；精确型号待丝印确认 |
 | D4 | 参考条件 | 无真 Elite 2、无 Windows 抓包机；但有**四类一手材料**：本机 Apple dext/插件/共享缓存反汇编、OGX-Mini(-2026) 的 GIP 主机实现、SDL/xone、Tinerou 的 Wine 侧实测记录 | 新路线把"必须反汇编苹果 GIP 主机"降为可选 |
@@ -132,8 +138,9 @@ node ../web/gamepad-probe.test.js
 ## 4. 目录
 
 ```
-README.md                                    本文件：结论速览 + 决策项
-docs/01-苹果侧-匹配规则与能力.md               Apple 匹配表（一手）、拨片 API、iOS 侧证据（暂缓）
+README.md                                    本文件：结论速览、平台状态、风险与决策项
+ACKNOWLEDGMENTS.md                           参考项目、规范、研究和可复用经验致谢
+docs/01-苹果侧-匹配规则与能力.md               Apple 匹配表（一手）、拨片 API、iOS/iPadOS 侧证据
 docs/02-输入侧-飞智接收器协议.md               接收器 VID/PID/接口/20B XInput/扩展按键/震动 + §7 真机实测（背键位、固件根因）
 docs/03-输出侧-GIP协议与Elite身份.md           GIP 命令表、能力位图、主机 init、Elite 拨片机制
 docs/04-方案对比与推荐路线.md                  路线对比 + 推荐阶梯 + 硬件选型 + 时延预算
@@ -215,7 +222,7 @@ firmware/probe/apple_controller_status.sh
 
 USB HID 规范允许自定义按键、传感器和输出报告，但“符合 `Generic Desktop/Game Pad (0x01/0x05)`”不等于 Apple 一定创建 `GCController`。本项目在同一台 Mac 上做过 A/B：有效 VID/PID、26 个按键、6 个轴的纯 Generic `1209:0001` 能被 IOHID、WebHID 和浏览器读取，但 `GCController.controllers()` 仍为 0；同一报告改用已经匹配的 `04B4:2412:0500` 身份后才收到 `GCControllerDidConnect`。因此按键数量、制造商字符串和非零 VID/PID 都不是单独的 Apple GameController 准入保证。
 
-同样，macOS 的 `GCController` 记录不能推出 iOS/iPadOS 对自制 USB HID 的支持；当前工程没有 iPad 真机结论。原生 GameController 的 haptics 和 battery 也不是 HID 报告存在就自动出现：当前已注册的 Vader2Pro 记录明确为 `supportsHaptics = 0`，`GCController.battery` 为 `nil`，所以这两项继续走 WebHID/接收器协议路径。
+同样，macOS 的 `GCController` 记录不能单独推出 iOS/iPadOS 对自制 USB HID 的支持；本项目后来收到一条 iPad 成功使用的用户实测记录，但没有完整保存机型、iPadOS 版本、供电方式、App 和长期运行日志。原生 GameController 的 haptics 和 battery 也不是 HID 报告存在就自动出现：当前已注册的 Vader2Pro 记录明确为 `supportsHaptics = 0`，`GCController.battery` 为 `nil`，所以这两项继续走 WebHID/接收器协议路径。
 
 旧版 `APPLE_BATTERY_PROBE=ON` 会在游戏手柄接口里附加 Battery Strength Report ID 3：
 
@@ -233,7 +240,7 @@ python3 rp2350/test/usb_desc_check.py --generic-apple --apple-battery \
 
 `-DGENERIC_GAMEPAD=ON` 构建使用标准 Game Pad Usage `0x01/0x05`、VID/PID `1209:0001`，并暴露 26 个按钮、6 轴、传感器和 WebHID 配置接口。按钮 0–16 按浏览器常见顺序安排，LT/RT 与 D-pad 同时保留模拟轴/hat 和数字按钮；M1–M4、C/Z/LM/RM/O 各占独立槽。初版 25 按钮 A/B 已确认 IOHID 能枚举，但不会触发 macOS `GCControllerDidConnect`；当前 26 按钮构建也仍未出现在 `GCController.controllers()`。Vader2Pro 身份已实测可触发 GameController，并暴露 38 个元素，仍是 macOS 原生游戏的兼容构建。
 
-HID Game Pad 描述符只证明底层输入可被解析，不保证 macOS Game Controller、浏览器标准震动、电量对象或 iOS/iPadOS 原生游戏支持。Apple 的[控制器发现文档](https://developer.apple.com/documentation/gamecontroller/discovering-game-controllers)和[iPhone 有线连接说明](https://support.apple.com/guide/iphone/connect-a-game-controller-iph9d38dd45f/27/ios/27)都以受支持或兼容的手柄为前提。`CHROMIUM_STADIA_PROBE` 是独立的双马达网页震动实验构建；Mac 锁屏期间新 USB 身份没有完成注册，原因尚未确定，浏览器与实体马达效果也未验证。
+HID Game Pad 描述符只证明底层输入可被解析，不保证 macOS Game Controller、浏览器标准震动、电量对象或 iOS/iPadOS 原生游戏支持。Apple 的[控制器发现文档](https://developer.apple.com/documentation/gamecontroller/discovering-game-controllers)和[iPhone 有线连接说明](https://support.apple.com/guide/iphone/connect-a-game-controller-iph9d38dd45f/27/ios/27)都以受支持或兼容的手柄为前提。当前有一条 iPad 成功使用的用户实测记录，但未覆盖全部机型、系统版本、供电和应用；`CHROMIUM_STADIA_PROBE` 是独立的双马达网页震动实验构建，浏览器与实体马达效果仍需分别确认。
 
 WebHID Feature/Status 报告是 63 字节，因此 TinyUSB `CFG_TUD_HID_EP_BUFSIZE` 必须为 64；`firmware/probe/hid_config_probe.swift` 可在不依赖网页的情况下验证配置、传感器、震动及 Flash 保存。`swift firmware/probe/hid_config_probe.swift --save` 会保存当前配置一次，并核对请求编号与异步成功状态；配置页也使用该编号避免旧状态或快速完成的写入误报。
 
@@ -255,9 +262,9 @@ Chrome 154/macOS 真机在当前 Generic 身份下给出 `mapping=""`、26 个�
 
 停振按钮在读取/保存等配置操作等待响应时仍可用，会直接发送零强度 Feature 报告；这条紧急停振路径不等待先前命令，也不把“已发送”当作马达已停止的确认。若同时有配置事务，旧事务的响应可能被停振响应覆盖，页面会按请求标记报告结果未知。固件自身的震动看门狗仍负责超时停振。
 
-`0x01/0x05` 是标准 HID Game Pad 用法，并不保证 Apple Game Controller 框架实例化该设备。Apple 的[控制器发现文档](https://developer.apple.com/documentation/gamecontroller/discovering-game-controllers)说明受支持控制器可通过 USB 连接 iPhone/iPad，但没有把任意自制 HID Game Pad 列为支持对象。当前纯 Generic 构建在本机 IOHID/Chrome 可见，`GCController.supportsHIDDevice(_:)` 对 Game Pad 接口返回 `true`，但 `GCController.controllers()` 仍为 0；同一报告改用已登记的 Vader2Pro 三元组后收到 `GCControllerDidConnect`。这表明 VID/PID/版本的模型匹配是当前 macOS 实测中的决定性差异之一，非零 VID/PID 和字符串本身不是充分条件；iOS/iPadOS 的系统游戏及 Safari 兼容性仍需在目标设备上实测。
+`0x01/0x05` 是标准 HID Game Pad 用法，并不保证 Apple Game Controller 框架实例化该设备。Apple 的[控制器发现文档](https://developer.apple.com/documentation/gamecontroller/discovering-game-controllers)说明受支持控制器可通过 USB 连接 iPhone/iPad，但没有把任意自制 HID Game Pad 列为支持对象。当前纯 Generic 构建在本机 IOHID/Chrome 可见，`GCController.supportsHIDDevice(_:)` 对 Game Pad 接口返回 `true`，但 `GCController.controllers()` 仍为 0；同一报告改用已登记的 Vader2Pro 三元组后收到 `GCControllerDidConnect`。这表明 VID/PID/版本的模型匹配是当前 macOS 实测中的决定性差异之一，非零 VID/PID 和字符串本身不是充分条件；iPad 已有用户成功使用记录，但机型、系统版本、供电、App 和副作用尚未形成可复现实验矩阵。
 
-对“标准 HID 描述符即可被 Apple 设备识别”的判定需分层：本机 Generic 固件已经通过 macOS 的 USB/IOHID 枚举及 Chrome Gamepad API 输入检查；它没有通过 `GCController` 连接检查，也没有 Chrome 标准震动对象。macOS WebKit 源码另有[直接匹配 Joystick/Game Pad 的 HID 提供者](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/gamepad/mac/HIDGamepadProvider.mm)，但这不等于本机 Safari 已完成输入验收。[iOS 家族的 WebKit 提供者选择](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/Gamepad/cocoa/UIGamepadProviderCocoa.mm)则直接使用 `GameControllerGamepadProvider`；因此 iPhone/iPad 的 Safari Gamepad API 不能凭 macOS IOHID 枚举推定可用。[iPhone](https://support.apple.com/guide/iphone/connect-a-game-controller-iph9d38dd45f/27/ios/27)和[iPad](https://support.apple.com/guide/ipad/ipad2746a7e9/ipados)说明都限定为“兼容”的有线手柄。目标设备上仍需分别检查系统“游戏控制器”设置、Safari 输入、额外按键、震动与电量；这些结果目前未知。
+对“标准 HID 描述符即可被 Apple 设备识别”的判定需分层：本机 Generic 固件已经通过 macOS 的 USB/IOHID 枚举及 Chrome Gamepad API 输入检查；它没有通过 `GCController` 连接检查，也没有 Chrome 标准震动对象。macOS WebKit 源码另有[直接匹配 Joystick/Game Pad 的 HID 提供者](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/gamepad/mac/HIDGamepadProvider.mm)，但这不等于本机 Safari 已完成输入验收。[iOS 家族的 WebKit 提供者选择](https://github.com/WebKit/WebKit/blob/main/Source/WebKit/UIProcess/Gamepad/cocoa/UIGamepadProviderCocoa.mm)则直接使用 `GameControllerGamepadProvider`；因此 iPhone/iPad 的 Safari Gamepad API 不能凭 macOS IOHID 枚举推定普遍可用。[iPhone](https://support.apple.com/guide/iphone/connect-a-game-controller-iph9d38dd45f/27/ios/27)和[iPad](https://support.apple.com/guide/ipad/ipad2746a7e9/ipados)说明都限定为“兼容”的有线手柄。当前 iPad 有成功使用记录，但仍需分别检查系统“游戏控制器”设置、Safari/App 输入、额外按键、震动、电量、睡眠唤醒和长期稳定性；未观察到的不良后果暂时未知。
 
 Generic 产品字符串恰好 31 字符，旧字符串回调未在达到缓冲上限时写入长度字段，macOS 的 USB 注册表因此显示回退名称 `Generic CDC`。修复后真机完整显示 `Flydigi Bridge Generic Game Pad`；但 `GCController.controllers()` 仍为 0，`FFIsForceFeedback` 仍返回 `0x80000003`。名称缺陷已排除，原生游戏识别与标准网页震动仍需独立解决。
 
@@ -265,7 +272,7 @@ Generic 产品字符串恰好 31 字符，旧字符串回调未在达到缓冲�
 
 随后验证了混合方案：保留 Generic 的 26 键/传感器/WebHID 报告，只使用 Vader2Pro 的 `04B4:2412:0500` 身份。该构建在 macOS 收到 `GCControllerDidConnect`，同时 HID 采样仍为 26 键；WebHID 读回电量、gyro/accel 和震动启动/停振均正常。当前 RP2350 留在此混合身份，纯 Generic 回退镜像保存在 `/tmp/flydigi-generic-before-apple-ab-20260930.uf2`。
 
-Apple DTS [说明](https://developer.apple.com/forums/thread/756692)普通 iOS 应用目前不能直接访问自定义 USB HID；[WebKit 的 Gamepad 实现](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/gamepad/cocoa/GameControllerGamepad.mm)从 `GCController` 读取输入。故“符合 USB-IF HID 规范且声明 `0x01/0x05`，就会被 macOS/iOS 原生游戏识别”并非可依赖的兼容性规则。本机只能确认 macOS 的 IOHID 枚举和 Chrome Gamepad API 输入，不能由此推定 iOS/iPadOS 的 GameController 接受情况。
+Apple DTS [说明](https://developer.apple.com/forums/thread/756692)普通 iOS 应用目前不能直接访问自定义 USB HID；[WebKit 的 Gamepad 实现](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/platform/gamepad/cocoa/GameControllerGamepad.mm)从 `GCController` 读取输入。故“符合 USB-IF HID 规范且声明 `0x01/0x05`，就会被 macOS/iOS 原生游戏识别”并非可依赖的兼容性规则。本机已确认 macOS 的 IOHID、Chrome Gamepad 和 `GCController` 路径，另有用户报告 iPad 可用；后者尚未记录足够环境细节，不能推定所有 iPadOS 版本和 App 都接受该身份。
 
 网页配置依赖 WebHID，与系统手柄识别分开判断。[WebKit](https://webkit.org/tracking-prevention/)将 WebHID 列为尚未实现的 API，因此 Safari 上配置页会直接显示不支持；macOS 的桌面 Chrome/Edge 是当前 WebHID 配置目标。
 

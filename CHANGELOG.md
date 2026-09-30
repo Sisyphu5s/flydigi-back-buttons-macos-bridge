@@ -11,4 +11,4 @@
 - 震动启动/停振确认、250 ms 看门狗、传感器 Report ID 1/2 和 CDC 诊断工具。
 - 主机 C/Python/网页验证和 Apple HID 描述符离线检查。
 
-已知边界：原生 `GCController.haptics` 和 `GCController.battery` 仍未暴露；iOS/iPadOS、Windows、Linux、Safari 和第三方游戏没有获得本项目的兼容性保证。详见 [`DISCLAIMER.md`](DISCLAIMER.md) 与 [`docs/06-风险与未知项.md`](docs/06-风险与未知项.md)。
+已知边界：原生 `GCController.haptics` 和 `GCController.battery` 仍未暴露；iPad 有一条用户成功使用记录，但没有完整兼容性矩阵，Windows、Linux、Safari 和第三方游戏没有获得本项目的兼容性保证。详见 [`DISCLAIMER.md`](DISCLAIMER.md) 与 [`docs/06-风险与未知项.md`](docs/06-风险与未知项.md)。

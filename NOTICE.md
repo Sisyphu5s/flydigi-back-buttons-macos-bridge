@@ -2,7 +2,7 @@
 
 ## Project license
 
-Original source code and documentation in this repository are released under the MIT License; see [`LICENSE`](LICENSE). Generated build directories, local captures and cloned reference repositories are intentionally excluded from the public repository.
+Original source code and documentation in this repository are released under the MIT License; see [`LICENSE`](LICENSE). Generated build directories, local captures and cloned reference repositories are intentionally excluded from the public repository. A categorized list of research sources and practical lessons is in [`ACKNOWLEDGMENTS.md`](ACKNOWLEDGMENTS.md).
 
 ## Trademarks and compatibility identities
 
@@ -13,3 +13,5 @@ Flydigi, Vader, Apple, GameController, Xbox, Elite, Microsoft, Waveshare and rel
 The research notes refer to external projects and specifications including Pico SDK, Pico-PIO-USB, TinyUSB, Flydigi5Pico, vader5pro-remap-driver, SDL, OGX-Mini, xone, WebKit and Microsoft's MS-GIPUSB specification. Those projects retain their own licenses and terms. Links and protocol references are provided for attribution and research context; no external project is relicensed by this repository.
 
 The `refs/` directory is an index of external sources and local evidence. It is not a vendored copy of those projects. When a source repository is present in a developer's local checkout, its own nested license remains authoritative for that source.
+
+The macOS path has been instrumented on the author's test setup. The repository also records a user report that the bridge worked on an iPad. That iPad report does not establish compatibility for every iPad model, iPadOS release, power arrangement or application, and possible side effects remain incompletely characterized.
