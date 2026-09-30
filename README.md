@@ -145,7 +145,7 @@ docs/02-输入侧-飞智接收器协议.md               接收器 VID/PID/接�
 docs/03-输出侧-GIP协议与Elite身份.md           GIP 命令表、能力位图、主机 init、Elite 拨片机制
 docs/04-方案对比与推荐路线.md                  路线对比 + 推荐阶梯 + 硬件选型 + 时延预算
 docs/05-实施步骤与里程碑.md                    Phase 0–4 + M0–M4 验收判据 + 三层验收 + 安全回滚
-docs/06-风险与未知项.md                        R1–R15 风险表：每条含"如何验证"和"失败退路"
+docs/06-风险与未知项.md                        R1–R17 风险表：每条含"如何验证"和"失败退路"
 docs/07-硬件-Waveshare-RP2350-USB-A要点.md     板子事实、R13 上拉坑、断连坑、替代板、供电
 docs/08-社区固件参考与GIP可抄清单.md           社区工程矩阵 + OGX-Mini 的 GIP 逐字节事实
 docs/09-OGX-Mini-2026与GPTK-Wine链路.md        OGX-Mini-2026 事实 + GIP 安全突破 + GPTK/Wine 层
