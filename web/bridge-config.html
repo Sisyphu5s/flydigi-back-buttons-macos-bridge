@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Flydigi Bridge WebHID</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
+    body { max-width: 860px; margin: 24px auto; padding: 0 16px; background: #11161b; color: #e8edf2; }
+    h1 { font-size: 22px; margin: 0 0 14px; }
+    section { border: 1px solid #34404a; padding: 14px; margin: 12px 0; border-radius: 6px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin: 8px 0; }
+    label { min-width: 130px; }
+    input[type=number] { width: 90px; }
+    input[type=range] { width: 210px; }
+    select { min-width: 116px; }
+    button { border: 1px solid #657585; border-radius: 4px; background: #26323d; color: inherit; padding: 7px 11px; cursor: pointer; }
+    button:hover { background: #344452; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .status { color: #a9d7ff; min-height: 1.4em; white-space: pre-wrap; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 6px 18px; }
+    .checkbox-row label { min-width: 70px; }
+    .checkbox-row label:first-child { min-width: 100px; }
+    @media (max-width: 520px) {
+      .checkbox-row { gap: 8px 10px; }
+      .checkbox-row label { min-width: 60px; }
+      .checkbox-row label:first-child { flex-basis: 100%; }
+    }
+    code { color: #b9e4b0; }
+  </style>
+</head>
+<body>
+  <h1>Flydigi Bridge WebHID</h1>
+  <div class="row">
+    <button id="connect">连接设备</button><button id="read">读取配置</button>
+    <button id="apply">应用配置</button><button id="save">保存到 Flash</button>
+    <button id="defaults">恢复默认</button><button id="rumble">震动测试</button>
+    <button id="rumbleStop">停止震动</button>
+  </div>
+  <div id="status" class="status">未连接</div>
+  <div id="telemetry" class="status">接收器状态: -</div>
+  <div id="pressedKeys" class="status">按键: -</div>
+
+  <section><strong>摇杆</strong>
+    <div class="grid">
+      <label>左死区 <input id="leftDeadzone" type="number" min="0" max="32767" step="1"></label>
+      <label>右死区 <input id="rightDeadzone" type="number" min="0" max="32767" step="1"></label>
+      <label>左曲线 <input id="leftCurve" type="range" min="0" max="255"><output id="leftCurveOut"></output></label>
+      <label>右曲线 <input id="rightCurve" type="range" min="0" max="255"><output id="rightCurveOut"></output></label>
+    </div>
+    <div class="row checkbox-row"><label>轴反向</label>
+      <label><input id="invLx" type="checkbox"> LX</label><label><input id="invLy" type="checkbox"> LY</label>
+      <label><input id="invRx" type="checkbox"> RX</label><label><input id="invRy" type="checkbox"> RY</label>
+    </div>
+    <div class="row checkbox-row"><label>交换轴</label>
+      <label><input id="swapLeftAxes" type="checkbox"> 左摇杆 X/Y</label>
+      <label><input id="swapRightAxes" type="checkbox"> 右摇杆 X/Y</label>
+    </div>
+    <div class="row checkbox-row"><label>径向死区</label>
+      <label><input id="radialLeft" type="checkbox"> 左摇杆</label>
+      <label><input id="radialRight" type="checkbox"> 右摇杆</label>
+    </div>
+    <div class="row checkbox-row"><label>输入源</label>
+      <label><input id="freshXinputSticks" type="checkbox"> 新鲜 XInput 摇杆轴</label>
+    </div>
+  </section>
+
+  <section><strong>震动与陀螺仪</strong>
+    <div class="grid">
+      <label>左马达增益 <input id="rumbleLeft" type="number" min="0" max="255"></label>
+      <label>右马达增益 <input id="rumbleRight" type="number" min="0" max="255"></label>
+      <label>测试左马达 <input id="testLeft" type="range" min="0" max="255" value="180"><output id="testLeftOut">180</output></label>
+      <label>测试右马达 <input id="testRight" type="range" min="0" max="255" value="180"><output id="testRightOut">180</output></label>
+      <label>最小间隔(ms) <input id="rumbleInterval" type="number" min="0" max="1000"></label>
+      <label>看门狗(ms) <input id="rumbleWatchdog" type="number" min="50" max="2000"></label>
+      <label>陀螺仪比例(%) <input id="gyroScale" type="number" min="1" max="400"></label>
+      <label>陀螺仪偏置 X/Y/Z <input id="gyroBias" type="text" placeholder="0,0,0"></label>
+    </div>
+    <div class="row checkbox-row"><label>陀螺仪反向</label>
+      <label><input id="invGx" type="checkbox"> X</label><label><input id="invGy" type="checkbox"> Y</label><label><input id="invGz" type="checkbox"> Z</label>
+    </div>
+    <div class="row"><button id="sensorConnect">连接传感器</button><span id="sensorStatus">未连接</span></div>
+    <div class="row"><span id="gyroValues">陀螺仪: -</span><span id="accelValues">加速度计: -</span></div>
+  </section>
+
+  <section><strong>按键映射</strong><div id="mapping" class="grid"></div></section>
+  <p>设备筛选：<code>Generic 1209:0001</code>、<code>Vader 04b4:2412</code>、<code>SCUF 实验身份 1b1c:3a28</code>、<code>Stadia 震动实验身份 18d1:9400</code>。需要在安全上下文打开此页（localhost 或 HTTPS）。</p>
+  <script src="bridge-config.js"></script>
+</body>
+</html>

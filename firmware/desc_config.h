@@ -1,0 +1,21 @@
+/* Vendor-defined WebHID configuration interface. */
+#pragma once
+#include <stdint.h>
+
+#define BRIDGE_CONFIG_REPORT_BYTES 63u
+#define BRIDGE_CONFIG_CMD_REPORT_ID 0x10u
+#define BRIDGE_CONFIG_RESPONSE_REPORT_ID 0x11u
+#define BRIDGE_CONFIG_STATUS_REPORT_ID 0x12u
+#define BRIDGE_CONFIG_TOKEN_OFFSET 61u
+
+static const uint8_t kDescBridgeConfig[] = {
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01,
+    0x85, BRIDGE_CONFIG_CMD_REPORT_ID,
+    0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, BRIDGE_CONFIG_REPORT_BYTES,
+    0xb1, 0x02,
+    0x85, BRIDGE_CONFIG_RESPONSE_REPORT_ID,
+    0x75, 0x08, 0x95, BRIDGE_CONFIG_REPORT_BYTES, 0xb1, 0x02,
+    0x85, BRIDGE_CONFIG_STATUS_REPORT_ID,
+    0x75, 0x08, 0x95, BRIDGE_CONFIG_REPORT_BYTES, 0x81, 0x02,
+    0xc0,
+};

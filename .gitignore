@@ -1,0 +1,49 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python, Node and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.vscode/
+.idea/
+
+# Host test outputs and local logs
+firmware/build/
+firmware/probe/*.log
+firmware/probe/gc_elements
+firmware/probe/gc_watch
+firmware/probe/gcprobe
+firmware/probe/gcprobe2
+firmware/probe/gcwatch
+firmware/probe/pdf_ocr
+firmware/probe/rx_inspect
+firmware/probe/rx_poke
+firmware/probe/brg_console.pyc
+
+# CMake/Ninja and generated RP2350 outputs
+firmware/rp2350/build*/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/build.ninja
+**/.ninja_deps
+**/.ninja_log
+**/cmake_install.cmake
+**/compile_commands.json
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.dis
+
+# Nested clones used only for local research; keep the public index only
+refs/*/
+!refs/README.md
+
+# Local captures, backups and generated scratch files
+/tmp/
+*.uf2.bak
+*.backup

@@ -1,0 +1,158 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Flydigi Generic Gamepad Probe</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; background:#11161b; color:#e8edf2 }
+  pre { white-space:pre-wrap; border:1px solid #34404a; padding:12px; max-width:900px }
+  button { padding:7px 11px; margin-right:8px }
+  select { max-width: min(100%, 520px); padding: 6px; margin: 0 8px 10px 0 }
+</style>
+<h1>Gamepad API probe</h1>
+<p>按一次手柄按键后观察状态；页面只读取本机浏览器 Gamepad API。</p>
+<label for="pad">手柄</label><select id="pad" aria-label="选择要测试震动的手柄"></select><br>
+<button id="pulse">Gamepad API 震动</button><button id="hidPulse">WebHID 震动</button><button id="clear">清空记录</button>
+<pre id="out">等待 navigator.getGamepads()...</pre>
+<script>
+(() => {
+  const out = document.querySelector('#out');
+  const padSelect = document.querySelector('#pad');
+  const log = [];
+  const previousButtons = new Map();
+  let padListKey = '';
+  let nextToken = crypto.getRandomValues(new Uint16Array(1))[0];
+  let hidPulseActive = false;
+  let lastPaint = 0;
+  const hidButton = document.querySelector('#hidPulse');
+  if (!navigator.hid) {
+    hidButton.disabled = true;
+    hidButton.title = '当前浏览器不支持 WebHID';
+  }
+  const state = () => [...navigator.getGamepads()].map((p, i) => p && ({
+    index: i, id: p.id, connected: p.connected, mapping: p.mapping,
+    buttons: p.buttons.length, axes: p.axes.length,
+    pressed: p.buttons.map((b, n) => b.pressed ? n : null).filter(n => n !== null),
+    activeButtonValues: p.buttons.map((b, n) => ({index:n, value:+b.value.toFixed(3)}))
+      .filter(b => b.value > 0),
+    values: p.axes.map(v => +v.toFixed(3)),
+    vibrationActuator: !!p.vibrationActuator,
+    actuatorTypes: p.vibrationActuator?.effects ? [...p.vibrationActuator.effects] : []
+  })).filter(Boolean);
+  const render = (paint = true) => {
+    const pads = state();
+    const listKey = pads.map(p => `${p.index}:${p.id}`).join('|');
+    if (listKey !== padListKey) {
+      const selected = padSelect.value;
+      padSelect.replaceChildren();
+      const placeholder = document.createElement('option');
+      placeholder.value = ''; placeholder.textContent = '选择手柄'; padSelect.append(placeholder);
+      for (const pad of pads) {
+        const option = document.createElement('option');
+        option.value = String(pad.index);
+        option.textContent = `${pad.index}: ${pad.id}`;
+        padSelect.append(option);
+      }
+      padSelect.value = pads.some(p => String(p.index) === selected) ? selected :
+        pads.length === 1 ? String(pads[0].index) : '';
+      padListKey = listKey;
+    }
+    for (const pad of pads) {
+      const before = previousButtons.get(pad.index) || [];
+      const pressed = pad.pressed;
+      for (const index of pressed.filter(index => !before.includes(index)))
+        log.push({event:'button-down', pad:pad.index, button:index, at:new Date().toISOString()});
+      for (const index of before.filter(index => !pressed.includes(index)))
+        log.push({event:'button-up', pad:pad.index, button:index, at:new Date().toISOString()});
+      previousButtons.set(pad.index, pressed);
+    }
+    const connectedIndices = new Set(pads.map(p => p.index));
+    for (const index of previousButtons.keys())
+      if (!connectedIndices.has(index)) previousButtons.delete(index);
+    if (log.length > 200) log.splice(0, log.length - 200);
+    if (paint) out.textContent = JSON.stringify({now: new Date().toISOString(), pads, log}, null, 2);
+  };
+  addEventListener('gamepadconnected', e => { log.push({event:'connected', id:e.gamepad.id}); render(); });
+  addEventListener('gamepaddisconnected', e => {
+    previousButtons.delete(e.gamepad.index);
+    log.push({event:'disconnected', id:e.gamepad.id}); render();
+  });
+  document.querySelector('#pulse').onclick = async () => {
+    const real = padSelect.value === '' ? null : navigator.getGamepads()[Number(padSelect.value)];
+    if (!real) { log.push({event:'vibration', result:'select a connected gamepad'}); render(); return; }
+    if (!real.vibrationActuator) { log.push({event:'vibration', pad:real.index, result:'no actuator'}); render(); return; }
+    try {
+      const result = await real.vibrationActuator.playEffect('dual-rumble',
+        {duration:250, strongMagnitude:.7, weakMagnitude:.35});
+      log.push({event:'vibration', pad:real.index, result:result ?? 'resolved without result'});
+    }
+    catch (e) { log.push({event:'vibration', pad:real.index, result:String(e)}); }
+    render();
+  };
+  const bridgeCommand = async (device, code, payload) => {
+    const report = new Uint8Array(63);
+    report[0] = code;
+    report.set(payload, 1);
+    nextToken = (nextToken + 1) & 0xffff || 1;
+    report[61] = nextToken & 0xff;
+    report[62] = nextToken >> 8;
+    await device.sendFeatureReport(0x10, report);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const view = await device.receiveFeatureReport(0x11);
+    const raw = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    const response = raw[0] === 0x11 ? raw.subarray(1) : raw;
+    if (response.length < 2 || response[0] !== 0)
+      throw new Error(`bridge rejected command (${response[0] ?? 'short response'})`);
+    if (response.length >= 63) {
+      const returnedToken = response[61] | response[62] << 8;
+      if (returnedToken && returnedToken !== nextToken)
+        throw new Error('bridge response belongs to another request');
+    }
+  };
+  document.querySelector('#hidPulse').onclick = async () => {
+    if (!navigator.hid) return;
+    if (hidPulseActive) return;
+    hidPulseActive = true;
+    hidButton.disabled = true;
+    try {
+      const filters = [
+        {vendorId:0x1209, productId:0x0001, usagePage:0xff00, usage:1},
+        {vendorId:0x04b4, productId:0x2412, usagePage:0xff00, usage:1},
+        {vendorId:0x1b1c, productId:0x3a28, usagePage:0xff00, usage:1},
+        {vendorId:0x18d1, productId:0x9400, usagePage:0xff00, usage:1}
+      ];
+      const matches = await navigator.hid.getDevices();
+      const granted = matches.filter(d => filters.some(f => d.vendorId === f.vendorId &&
+        d.productId === f.productId && d.collections.some(c => c.usagePage === f.usagePage && c.usage === f.usage)));
+      let device = granted.length === 1 ? granted[0] : null;
+      if (!device) [device] = await navigator.hid.requestDevice({filters});
+      if (!device) return;
+      if (!device.opened) await device.open();
+      let startError;
+      try {
+        await bridgeCommand(device, 7, [180, 180]);
+        log.push({event:'webhid-vibration', device:device.productName, result:'start accepted'});
+        await new Promise(resolve => setTimeout(resolve, 250));
+      } catch (e) {
+        startError = e;
+      } finally {
+        try {
+          await bridgeCommand(device, 7, [0, 0]);
+          log.push({event:'webhid-vibration', device:device.productName, result:'stop accepted'});
+        } catch (e) {
+          log.push({event:'webhid-vibration', device:device.productName, result:`stop failed: ${e}`});
+        }
+      }
+      if (startError) throw startError;
+    } catch (e) { log.push({event:'webhid-vibration', result:String(e)}); }
+    finally { hidPulseActive = false; hidButton.disabled = false; render(); }
+  };
+  document.querySelector('#clear').onclick = () => { log.length = 0; previousButtons.clear(); render(); };
+  const sample = timestamp => {
+    const paint = timestamp - lastPaint >= 50;
+    render(paint);
+    if (paint) lastPaint = timestamp;
+    requestAnimationFrame(sample);
+  };
+  requestAnimationFrame(sample);
+  render();
+})();
+</script>
