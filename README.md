@@ -31,6 +31,12 @@ python3 firmware/rp2350/test/usb_desc_check.py --generic-apple \
   firmware/rp2350/build-apple-compatible/flydigi_bridge.elf
 ```
 
+### 预编译固件
+
+公开 Release 会附带经过本机 `picotool` 写入和校验的 Apple 兼容 UF2。预编译文件只适用于文档中列出的 RP2350 配置；刷写前仍须保存整片 Flash，并阅读 [`DISCLAIMER.md`](DISCLAIMER.md)。
+
+下载入口：<https://github.com/Sisyphu5s/flydigi-elite-bridge/releases/latest>
+
 ### 刷写
 
 先保存现有 Flash 镜像，再让 RP2350 进入 BOOTSEL。刷写会替换整片程序存储；不要在未确认备份可用时执行。
