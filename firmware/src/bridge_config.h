@@ -84,6 +84,12 @@ bool bridge_config_set(const bridge_config_t *cfg);
 bool bridge_config_upgrade_generic_defaults(bridge_config_t *cfg);
 #endif
 
+#if defined(GENERIC_APPLE_IDENTITY)
+/* Upgrade only the previous unmodified Apple default config in flash
+ * (flags==0 and factory button map) to the current performance defaults. */
+bool bridge_config_upgrade_apple_defaults(bridge_config_t *cfg);
+#endif
+
 /* Fixed-point stick shaping.  deadzone is in raw int16 units; curve is a
  * blend from linear (0) to cubic (255), which is stable and cheap on RP2350. */
 uint8_t bridge_axis_u8(int16_t raw, bool invert, uint16_t deadzone, uint8_t curve);

@@ -50,6 +50,11 @@ void bridge_config_defaults(bridge_config_t *cfg)
 #if defined(GENERIC_GAMEPAD) && !defined(GENERIC_APPLE_IDENTITY) && !defined(CORSAIR_APPLE_IDENTITY)
     cfg->flags = BRIDGE_FLAG_GENERIC_STANDARD_BUTTONS |
                  BRIDGE_FLAG_GENERIC_DPAD_MAPPING;
+#elif defined(GENERIC_APPLE_IDENTITY)
+    /* 摇杆优先采用更新鲜的 XInput 采样（~310 Hz 的流），EF 仅在新于 XInput
+     * 时回退；相比 EF-only（~94.7 Hz）采样快约 3 倍。
+     * 双源数值域已实测一致（满量程 ±32767、中心 ≈0），叠加不产生跳变。 */
+    cfg->flags = BRIDGE_FLAG_FRESH_XINPUT_STICKS;
 #endif
     for (unsigned i = 0; i < BRIDGE_INPUT_BUTTONS; i++)
         cfg->button_map[i] = BRIDGE_BUTTON_DISABLED;
@@ -109,6 +114,23 @@ bool bridge_config_upgrade_generic_defaults(bridge_config_t *cfg)
     memcpy(cfg->button_map, defaults.button_map, sizeof cfg->button_map);
     cfg->flags = BRIDGE_FLAG_GENERIC_STANDARD_BUTTONS |
                  BRIDGE_FLAG_GENERIC_DPAD_MAPPING;
+    bridge_config_finalize(cfg);
+    return true;
+}
+#endif
+
+#if defined(GENERIC_APPLE_IDENTITY)
+bool bridge_config_upgrade_apple_defaults(bridge_config_t *cfg)
+{
+    if (!bridge_config_validate(cfg)) return false;
+    bridge_config_t defaults;
+    bridge_config_defaults(&defaults);
+    /* 只升级“从未动过”的 Apple 默认配置：flags 为 0 且按键表与默认完全一致；
+     * 动过按键表的用户配置保持原样（可在配置页手动开启摇杆叠加）。 */
+    if (cfg->flags != 0 ||
+        memcmp(cfg->button_map, defaults.button_map, sizeof cfg->button_map) != 0)
+        return false;
+    cfg->flags = defaults.flags;
     bridge_config_finalize(cfg);
     return true;
 }
