@@ -103,6 +103,8 @@ static bool     s_verbose;
 static bool     s_banner_done;
 static uint32_t s_reports_sent;
 static uint32_t s_usb_rate;                /* 最近整 1 秒的 gamepad 报文入队数（目标 ≈1000/s） */
+static uint32_t s_usb_dt_min_us, s_usb_dt_max_us, s_usb_refill_late;
+static uint32_t s_last_refill_us;
 static uint8_t  s_last_rep[VADER2PRO_REPORT_BYTES];
 static uint32_t s_bridge_age_last_us, s_bridge_age_min_us, s_bridge_age_max_us;
 static uint32_t s_bridge_age_samples;
@@ -526,10 +528,6 @@ static void log_status(void)
 {
     fd_host_status_t st;
     flydigi_host_get(NULL, &st, NULL);
-    brg_log("[IDLE] sent=%lu queuefail=%lu done=%lu last=%u result=%u\n",
-            (unsigned long)st.hid_idle_sent, (unsigned long)st.hid_idle_queue_fail,
-            (unsigned long)st.hid_idle_complete, st.hid_idle_last_itf,
-            st.hid_idle_last_result);
     brg_log("[BRG] core1 alive=%lu stage=%lu ticks=%lu tuh_ret=%lu | mounts=%lu umounts=%lu(last daddr=%u) xi=%d ex=%d\n",
             (unsigned long)s_core1_alive, (unsigned long)s_core1_stage,
             (unsigned long)s_core1_ticks, (unsigned long)s_core1_cycles,
@@ -540,14 +538,20 @@ static void log_status(void)
          st.xitf_num, st.ext_itf_num,
          st.xep_in, st.xep_in_size, st.ext_ep_in, st.ext_ep_in_size,
          st.ext_ep_out, st.ext_ep_out_size);
-    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu usb=%lu/s\n",
+    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu usb=%lu/s usb_dt=%lu..%lu late=%lu\n",
          (unsigned long)st.xinput_reports, (unsigned long)st.xinput_invalid_buttons,
          (unsigned long)st.ext_reports,
          (unsigned long)st.ext_frames, (unsigned long)st.ext_bad_checksum,
          (unsigned long)st.cmds_sent,
             st.ext_us_stale != 0 && st.ext_us_stale < FD_EXT_FRESH_US ? "yes" : "no",
             (unsigned long)st.ext_us_stale, (unsigned long)s_reports_sent,
-            (unsigned long)s_usb_rate);
+            (unsigned long)s_usb_rate,
+            (unsigned long)s_usb_dt_min_us, (unsigned long)s_usb_dt_max_us,
+            (unsigned long)s_usb_refill_late);
+    /* 输入新鲜度：接收器回调 → USB 入队的年龄（只在内容变化时采样）。 */
+    brg_log("[AGE] input_us last=%lu min=%lu max=%lu n=%lu\n",
+            (unsigned long)s_bridge_age_last_us, (unsigned long)s_bridge_age_min_us,
+            (unsigned long)s_bridge_age_max_us, (unsigned long)s_bridge_age_samples);
     brg_log("[POWER] valid=%d level=%u state=%u updates=%lu rumble=%lu/%lu spikes=%lu xi_dt=%lu..%lu ext_dt=%lu..%lu us\n",
             (int)st.battery_valid, st.battery_percent, st.battery_state,
             (unsigned long)st.battery_updates, (unsigned long)st.rumble_sent,
@@ -636,6 +640,14 @@ static void bridge_task(void)
         vader2pro_set_last_report(rep);
         s_reports_sent++;
         rate_count++;
+        /* USB 节奏诊断：相邻两次成功入队的间隔应恒为 ≈1 ms（主机每帧轮询一次）。 */
+        if (s_last_refill_us != 0) {
+            uint32_t const dt = t - s_last_refill_us;
+            if (s_usb_dt_min_us == 0 || dt < s_usb_dt_min_us) s_usb_dt_min_us = dt;
+            if (dt > s_usb_dt_max_us) s_usb_dt_max_us = dt;
+            if (dt > 1500u) s_usb_refill_late++;
+        }
+        s_last_refill_us = t;
         /* This is receiver callback to USB queue age, not radio or Mac latency. */
         uint32_t age_us;
         if (bridge_changed_age_us(time_us_32(), &sample, sticks_changed,
@@ -665,7 +677,9 @@ static void sensor_task(void)
     static bool gyro_turn;
     uint32_t const t = time_us_32();
     if ((int32_t)(t - next_us) < 0) return;
-    next_us = t + HID_REPORT_INTERVAL_US;
+    next_us += HID_REPORT_INTERVAL_US;                        /* 固定 1 ms 网格（逐次重锚会漂移到 ~970/s） */
+    if ((int32_t)(t - next_us) >= (int32_t)HID_REPORT_INTERVAL_US)  /* 落后 ≥1 拍才重新对齐 */
+        next_us = t + HID_REPORT_INTERVAL_US;
     if (!tud_hid_n_ready(1)) return;
 
     flydigi_rx_state_t rx;
