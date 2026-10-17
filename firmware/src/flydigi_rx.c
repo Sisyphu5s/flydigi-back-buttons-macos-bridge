@@ -108,35 +108,18 @@ bool flydigi_xinput_buttons_valid(uint16_t xinput_buttons)
     return (xinput_buttons & (uint16_t)~FD_XINPUT_KNOWN_BUTTON_MASK) == 0;
 }
 
-bool flydigi_rx_merge(const flydigi_rx_state_t *base, bool base_fresh, uint32_t base_age_us,
-                      const flydigi_rx_state_t *ext, bool ext_fresh, uint32_t ext_age_us,
-                      bool fresh_xinput_sticks, flydigi_rx_state_t *out)
+void flydigi_rx_merge(const flydigi_rx_state_t *base, bool base_fresh,
+                      const flydigi_rx_state_t *ext, bool ext_fresh,
+                      flydigi_rx_state_t *out)
 {
-    if (out == NULL || base == NULL || ext == NULL) return false;
+    if (out == NULL || base == NULL || ext == NULL) return;
     *out = (flydigi_rx_state_t){0};
+    /* 输入统一走 EF（飞智厂商通道）：摇杆、扳机、标准键、扩展键、Home、IMU
+     * 全部以 EF 为准。XInput 只在 EF 断流时作为整帧兜底，不再混入。 */
     if (ext_fresh) *out = *ext;
     else if (base_fresh) *out = *base;
-
-    /* The receiver's EF stream is required for M1-M4 and IMU, but on the
-     * current 2.4G firmware its byte[11]/byte[12] standard-button fields can
-     * remain zero while the XInput endpoint carries the real transitions.
-     * Both parsers normalize D-pad bits to the same U/R/D/L constants, so
-     * merge the standard fields from both fresh streams.  EF's ~100 Hz
-     * release updates clear a short-lived event-driven XInput bit without
-     * sacrificing an EF-only button transition. */
-    if (ext_fresh && base_fresh) {
-        out->b1 = (uint8_t)(ext->b1 | base->b1);
-        out->b2 = (uint8_t)(ext->b2 | base->b2);
-    }
     out->guide = ext_fresh ? (ext->ext2 & FD_EXT2_HOME) != 0 :
                  base_fresh && base->guide;
-    bool const use_base_sticks = fresh_xinput_sticks && base_fresh && ext_fresh &&
-                                 base_age_us < ext_age_us;
-    if (use_base_sticks) {
-        out->lx = base->lx; out->ly = base->ly;
-        out->rx = base->rx; out->ry = base->ry;
-    }
-    return use_base_sticks;
 }
 
 void flydigi_cmd_pack(const flydigi_cmd_t *c, uint8_t out[FD_CMD_BYTES])

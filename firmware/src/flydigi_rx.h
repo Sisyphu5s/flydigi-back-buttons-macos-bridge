@@ -86,11 +86,12 @@ void flydigi_xinput_normalize_buttons(uint16_t xinput_buttons,
  * the extended stream. */
 bool flydigi_xinput_buttons_valid(uint16_t xinput_buttons);
 
-/* EF owns buttons, triggers and IMU while fresh. The optional stick mode
- * overlays only a newer XInput stick sample; it never imports trigger spikes. */
-bool flydigi_rx_merge(const flydigi_rx_state_t *base, bool base_fresh, uint32_t base_age_us,
-                      const flydigi_rx_state_t *ext, bool ext_fresh, uint32_t ext_age_us,
-                      bool fresh_xinput_sticks, flydigi_rx_state_t *out);
+/* EF is the single authoritative source while fresh (sticks, triggers, buttons,
+ * extended keys, Home and IMU).  XInput is consulted only as a full fallback
+ * when the EF stream has stalled; mixed-source merging is intentionally gone. */
+void flydigi_rx_merge(const flydigi_rx_state_t *base, bool base_fresh,
+                      const flydigi_rx_state_t *ext, bool ext_fresh,
+                      flydigi_rx_state_t *out);
 
 /* M1..M4（m = 1..4） */
 static inline bool flydigi_m_pressed(const flydigi_rx_state_t *s, unsigned m)

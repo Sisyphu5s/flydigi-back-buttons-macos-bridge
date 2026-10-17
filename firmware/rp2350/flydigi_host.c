@@ -958,26 +958,18 @@ void flydigi_host_get(flydigi_rx_state_t *out, fd_host_status_t *out_st,
 {
     uint32_t const t = now_us();
     flydigi_rx_state_t r;
-    bool fresh_xinput_sticks = false;
-    if (out != NULL || sample != NULL) {
-        bridge_config_t cfg;
-        bridge_config_get(&cfg);
-        fresh_xinput_sticks = (cfg.flags & BRIDGE_FLAG_FRESH_XINPUT_STICKS) != 0;
-    }
 
     critical_section_enter_blocking(&s_state_lock);
 
     bool const base_fresh = s_base_us != 0 && (t - s_base_us) < FD_EXT_FRESH_US;
     bool const ext_fresh  = s_ext_us  != 0 && (t - s_ext_us)  < FD_EXT_FRESH_US;
-    bool const base_sticks = flydigi_rx_merge(&s_base, base_fresh, t - s_base_us,
-                                               &s_ext, ext_fresh, t - s_ext_us,
-                                               fresh_xinput_sticks, &r);
+    flydigi_rx_merge(&s_base, base_fresh, &s_ext, ext_fresh, &r);
     if (sample) {
-        sample->sticks_us = base_sticks ? s_base_us :
-                            ext_fresh ? s_ext_us : base_fresh ? s_base_us : 0;
-        sample->other_us = ext_fresh ? s_ext_us : base_fresh ? s_base_us : 0;
+        uint32_t const source_us = ext_fresh ? s_ext_us : base_fresh ? s_base_us : 0;
+        sample->sticks_us = source_us;
+        sample->other_us = source_us;
         sample->sensor_us = ext_fresh ? s_ext_us : 0;
-        sample->xinput_overlay = base_sticks;
+        sample->xinput_overlay = false;
     }
     if (out_st) *out_st = g_fd;
     critical_section_exit(&s_state_lock);

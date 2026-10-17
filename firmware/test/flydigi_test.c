@@ -58,38 +58,30 @@ int main(void)
     base.lt = 255; base.rt = 255; base.guide = true;
     ext.lx = 1000; ext.ly = 2000; ext.rx = 3000; ext.ry = 4000;
     ext.lt = 12; ext.rt = 34; ext.ext1 = FD_EXT_M1; ext.ext2 = 0;
-    CHECK(!flydigi_rx_merge(&base, true, 1000, &ext, true, 5000, false, &merged) &&
-          merged.lx == ext.lx && merged.lt == ext.lt && merged.ext1 == FD_EXT_M1 &&
-          !merged.guide, "默认 EF 优先且不引入 XInput 扳机/Home");
-    base.b1 = FD_B1_A | FD_B1_DPAD_UP;
-    base.b2 = FD_B2_RB;
-    ext.b1 = 0;
-    ext.b2 = 0;
-    CHECK(!flydigi_rx_merge(&base, true, 1000, &ext, true, 5000, false, &merged) &&
-          merged.b1 == base.b1 && merged.b2 == base.b2 &&
-          merged.ext1 == FD_EXT_M1,
-          "EF 标准键为空时合并新鲜 XInput 的 A/D-pad/RB");
+    flydigi_rx_merge(&base, true, &ext, true, &merged);
+    CHECK(merged.lx == ext.lx && merged.ly == ext.ly &&
+          merged.rx == ext.rx && merged.ry == ext.ry &&
+          merged.lt == ext.lt && merged.rt == ext.rt &&
+          merged.ext1 == FD_EXT_M1 && !merged.guide,
+          "EF 新鲜时为唯一来源（摇杆/扳机/扩展键全取 EF，不引入 XInput）");
     base.b1 = FD_B1_A | FD_B1_DPAD_UP;
     base.b2 = FD_B2_RB;
     ext.b1 = FD_B1_B;
     ext.b2 = FD_B2_LB;
-    CHECK(!flydigi_rx_merge(&base, true, 1000, &ext, true, 5000, false, &merged) &&
-          merged.b1 == (uint8_t)(FD_B1_A | FD_B1_B | FD_B1_DPAD_UP) &&
-          merged.b2 == (uint8_t)(FD_B2_LB | FD_B2_RB),
-          "EF 与 XInput 的标准键位按归一化位域合并");
-    CHECK(flydigi_rx_merge(&base, true, 1000, &ext, true, 5000, true, &merged) &&
-          merged.lx == base.lx && merged.ly == base.ly &&
-          merged.rx == base.rx && merged.ry == base.ry &&
-          merged.lt == ext.lt && merged.rt == ext.rt && merged.ext1 == FD_EXT_M1 &&
-          !merged.guide && merged.gyro[0] == ext.gyro[0],
-          "可选模式只取较新的 XInput 摇杆轴");
-    CHECK(!flydigi_rx_merge(&base, true, 5000, &ext, true, 1000, true, &merged) &&
-          merged.lx == ext.lx, "较旧的 XInput 不覆盖 EF 摇杆轴");
-    CHECK(!flydigi_rx_merge(&base, true, 1000, &ext, false, 250000, true, &merged) &&
-          merged.lx == base.lx && merged.lt == base.lt && merged.guide,
-          "EF 过期后恢复完整 XInput 兜底");
-    CHECK(!flydigi_rx_merge(&base, false, 250000, &ext, false, 250000, true, &merged) &&
-          merged.lx == 0 && merged.lt == 0 && !merged.guide,
+    flydigi_rx_merge(&base, true, &ext, true, &merged);
+    CHECK(merged.b1 == FD_B1_B && merged.b2 == FD_B2_LB,
+          "EF 新鲜时标准键以 EF 为准（不再与 XInput 合并）");
+    ext.b1 = 0;
+    ext.b2 = 0;
+    flydigi_rx_merge(&base, true, &ext, true, &merged);
+    CHECK(merged.b1 == 0 && merged.b2 == 0,
+          "EF 标准键为空时不再由 XInput 补位（指定 EF 单一来源）");
+    flydigi_rx_merge(&base, true, &ext, false, &merged);
+    CHECK(merged.lx == base.lx && merged.lt == base.lt && merged.guide &&
+          merged.b1 == base.b1 && merged.b2 == base.b2,
+          "EF 断流时整帧回退到 XInput 兜底");
+    flydigi_rx_merge(&base, false, &ext, false, &merged);
+    CHECK(merged.lx == 0 && merged.lt == 0 && !merged.guide,
           "两个输入源均过期时释放全部输入");
 
     static const uint8_t trigger_spike[20] = {

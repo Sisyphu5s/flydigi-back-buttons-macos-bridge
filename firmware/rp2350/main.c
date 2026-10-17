@@ -142,7 +142,7 @@ static bool config_load_flash(void)
     const bridge_config_t *stored = (const bridge_config_t *)(XIP_BASE + BRIDGE_CONFIG_FLASH_OFFSET);
     if (!bridge_config_validate(stored)) return false;
 #if defined(APPLE_PERSISTENT_CONFIG)
-    /* 未自定义过的默认配置：升级为新的性能默认值（摇杆 XInput 叠加）。 */
+    /* 未自定义过的默认配置：清理历史标志（摇杆叠加已废弃，输入统一走 EF）。 */
     bridge_config_t loaded = *stored;
     if (bridge_config_upgrade_apple_defaults(&loaded)) s_cfg_save_pending = true;
     return bridge_config_set(&loaded);
