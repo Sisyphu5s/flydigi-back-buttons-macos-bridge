@@ -52,7 +52,19 @@
 
 本次下载的本地副本：`~/.hermes/cache/scratch/refs2/`（qsantos 三篇 txt + raw html、OGX-Mini README、OGX-Mini 的 GIP 源码 4 个文件）。
 
-## D. 复读用命令
+## D. 2026-10-17 追加（Vader 5 Pro 生态新项目）
+
+| 仓库 | 是什么 | 用途一句话 |
+|---|---|---|
+| [AlexandreFournier/xpad-flydigi](https://github.com/AlexandreFournier/xpad-flydigi) | Linux 内核驱动（xpad 系） | 接收器 `37d7:2401` 四接口表 + "厂商命令阻塞全端点 ~18ms"结论；握手/test-mode 命令与我方固件逐字节一致 |
+| [FilipVajgand/openvader](https://github.com/FilipVajgand/openvader) | macOS 配置 App（含 `docs/PROTOCOL.md`、`Sources/vaderctl`） | Vader 5 Pro 命令全集与实测属性（心跳/电池/版本/睡眠/报告率/EF 流）；禁用命令清单 |
+| [BANANASJIM/padctl](https://github.com/BANANASJIM/padctl) | vader5pro-remap 演进版（多设备 HID 守护） | 印证 EF-only 输入决策；震动走 IF0 XInput OUT（8 字节，无 18ms 代价）；输出伪装 Elite 2（`045e:0b00`） |
+| [TJLawInOrbit/tux-invader](https://github.com/TJLawInOrbit/tux-invader) | Python 协议实现 | 命令构造/checksum 公式；数字扳机/FN/TURBO/HOME 位定义；EF ~500Hz 观测 |
+| [Blank0416/flydigi-dock-tools](https://github.com/Blank0416/flydigi-dock-tools) | 底座 / 充电工具 | 出厂 15 分钟睡眠定时器 → 周期性 surprise-removal；`0xFFEE` 配置通道行为 |
+
+详见 `docs/14-社区项目调研-2026-10.md`（各项目关键结论、协议细节与对照待办）。
+
+## E. 复读用命令
 
 ```bash
 # 苹果匹配表
