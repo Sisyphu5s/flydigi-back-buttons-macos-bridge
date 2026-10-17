@@ -61,7 +61,12 @@ bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
     uint8_t const power = buf[11] >> 4;
     uint8_t const level = buf[11] & 0x0f;
     if (power > 2 || level > 10) return false;
-    *percent = power == 2 ? 100 : (uint8_t)(level * 10);
+    /* Vader 5 Pro 电量 nibble 为 20% 步进；SDL / openvader / tux-invader /
+     * openflydigi 四个独立实现一致（10% 步进仅适用于 Apex 6）。现场出现过
+     * nibble=10 的满电读数，统一按 *20 并封顶 100。 */
+    uint8_t pct = (uint8_t)(level * 20u);
+    if (pct > 100u) pct = 100u;
+    *percent = power == 2 ? 100 : pct;
     *power_state = power;
     return true;
 }

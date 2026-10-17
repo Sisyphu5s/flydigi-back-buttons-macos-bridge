@@ -36,6 +36,7 @@ static critical_section_t s_state_lock;
 static volatile bool s_resend_requested;
 static volatile bool s_hwinfo_pending;      /* 按需发送 cmd 03（硬件状态） */
 static bool s_hwinfo_auto_done;             /* 开机后自动补发只做一次 */
+static bool s_acquire_auto_done;            /* 开机自动声明接管（高帧率流）只做一次 */
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_rumble_left, s_rumble_right;
@@ -176,6 +177,7 @@ static void fd_clear_device_state(void)
     g_fd.hw_status_replies = 0;
     s_hwinfo_pending = false;
     s_hwinfo_auto_done = false;
+    s_acquire_auto_done = false;
     g_fd.rumble_ack_left = 0;
     g_fd.rumble_ack_right = 0;
     g_fd.ext_frame_seen = false;
@@ -860,6 +862,15 @@ static void fd_send_cmds(void)
             s_hwinfo_auto_done = true;
             s_hwinfo_pending = true;
         }
+        /* SDL 式接管声明（0x1C）：接收器据此切到高帧率流（EF 实测 97→716 Hz）。
+         * 每次挂载/断流恢复只声明一次；接收器会记录占用者（此处为 "BRG"）。 */
+        if (!s_acquire_auto_done) {
+            s_acquire_auto_done = true;
+            critical_section_enter_blocking(&s_state_lock);
+            s_acquire_value = true;
+            s_acquire_pending = true;
+            critical_section_exit(&s_state_lock);
+        }
     } else {
         s_ex.cmd_next_ms = now_ms() + FD_CMD_GAP_MS;
     }
@@ -890,6 +901,8 @@ void flydigi_host_task(void)
         s_ex.cmd_idx = 0;
         s_ex.cmd_next_ms = ms + FD_CMD_GAP_MS;
         s_retry_ms = ms + 2000;
+        /* 断流恢复后重新声明接管（高帧率流） */
+        s_acquire_auto_done = false;
     }
 
     critical_section_enter_blocking(&s_state_lock);

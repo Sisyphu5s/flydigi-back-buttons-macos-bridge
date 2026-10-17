@@ -197,6 +197,16 @@ int main(void)
     CHECK(flydigi_rx_battery_status(STATUS, sizeof STATUS, &battery_percent, &power_state) &&
           battery_percent == 100 && power_state == 0,
           "真机 device-info 帧电量 0x0a → 100%%");
+    {
+        uint8_t mid_status[sizeof STATUS];
+        memcpy(mid_status, STATUS, sizeof mid_status);
+        mid_status[11] = 0x03;                     /* 放电中，3 档 → 60% */
+        update_frame_checksum(mid_status);
+        CHECK(flydigi_rx_battery_status(mid_status, sizeof mid_status,
+                                        &battery_percent, &power_state) &&
+              battery_percent == 60 && power_state == 0,
+              "电量 nibble=3 → 60%%（20%% 步进）");
+    }
     uint8_t invalid_status[sizeof STATUS];
     memcpy(invalid_status, STATUS, sizeof invalid_status);
     invalid_status[11] = 0xfa;
