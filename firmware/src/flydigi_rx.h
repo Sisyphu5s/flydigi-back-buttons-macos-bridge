@@ -71,6 +71,18 @@ bool flydigi_rx_parse(const uint8_t *buf, size_t len, flydigi_rx_state_t *out);
 bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
                                uint8_t *percent, uint8_t *power_state);
 
+/* Decode a device-info reply (cmd 01) beyond the battery nibble: model
+ * (130 = Vader 5 Pro), connection (1 wired / 2 wireless) and the main firmware
+ * version as BCD nibbles (e.g. 0x7140 → "7.1.4.0"). */
+bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
+                            uint8_t *model, uint8_t *connection, uint16_t *fw_bcd);
+
+/* Decode a hardware-status reply (cmd 03): sleep minutes (0 = never), report
+ * rate field, stick precision and stick sensitivity (raw device values). */
+bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
+                          uint8_t *report_rate, uint8_t *precision,
+                          uint8_t *sensitivity);
+
 /* Reject the receiver's observed all-idle XInput packet with both triggers
  * high when a recent EF frame confirms they are released. */
 bool flydigi_rx_xinput_idle_spike(const uint8_t *buf, size_t len,

@@ -87,6 +87,15 @@ typedef struct {
     bool     battery_valid;
     uint8_t  battery_percent, battery_state;
     uint32_t battery_updates, rumble_sent, rumble_fail;
+
+    /* 设备信息（cmd 01）与硬件状态（cmd 03，按需读取）。 */
+    bool     dev_info_valid;
+    uint8_t  dev_model, dev_connection;      /* 130 = Vader 5 Pro；1 有线 / 2 无线 */
+    uint16_t dev_fw_version;                 /* BCD 半字节：0x7140 → 7.1.4.0 */
+    bool     hw_status_valid;
+    uint8_t  hw_sleep_minutes, hw_report_rate;
+    uint8_t  hw_stick_precision, hw_stick_sensitivity;
+    uint32_t hw_status_replies;
     uint8_t  rumble_ack_left, rumble_ack_right; /* last successful OUT transfer */
     uint32_t xinput_min_interval_us, xinput_max_interval_us;
     uint32_t ext_min_interval_us, ext_max_interval_us;
@@ -140,6 +149,9 @@ size_t flydigi_host_get_events(fd_input_event_t *out, size_t capacity);
 
 /* 重排命令序列（控制台 'r'）：从头再发一遍握手、状态查询和 test mode */
 void flydigi_host_resend_cmds(void);
+
+/* 请求一次硬件状态（控制台 's'，cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
+void flydigi_host_request_hw_status(void);
 
 /* One-shot SDL-style acquire/release probe on the receiver's command endpoint. */
 void flydigi_host_acquire_probe(bool acquire);

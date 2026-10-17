@@ -551,6 +551,14 @@ static void log_status(void)
             (unsigned long)s_usb_rate,
             (unsigned long)s_usb_dt_min_us, (unsigned long)s_usb_dt_max_us,
             (unsigned long)s_usb_refill_late);
+    /* 设备信息（cmd 01）+ 硬件状态（cmd 03）：固件/连接/睡眠/报告率 */
+    brg_log("[DEV] model=%u conn=%u fw=%u.%u.%u.%u sleep_min=%u rate=%u prec=%u sens=%u hwn=%lu\n",
+            st.dev_model, st.dev_connection,
+            (st.dev_fw_version >> 12) & 0xF, (st.dev_fw_version >> 8) & 0xF,
+            (st.dev_fw_version >> 4) & 0xF, st.dev_fw_version & 0xF,
+            st.hw_sleep_minutes, st.hw_report_rate,
+            st.hw_stick_precision, st.hw_stick_sensitivity,
+            (unsigned long)st.hw_status_replies);
     /* 输入新鲜度：接收器回调 → USB 入队的年龄（只在内容变化时采样）。 */
     brg_log("[AGE] input_us last=%lu min=%lu max=%lu n=%lu\n",
             (unsigned long)s_bridge_age_last_us, (unsigned long)s_bridge_age_min_us,
@@ -756,7 +764,7 @@ static void log_banner(void)
     brg_log("identity: VID=%04x PID=%04x bcdDevice=%04x  HID report=%u B, %u bytes\n",
          BRIDGE_USB_VID, BRIDGE_USB_PID, BRIDGE_USB_BCD,
          (unsigned)sizeof(BRIDGE_GAMEPAD_DESC), VADER2PRO_REPORT_BYTES);
-    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
+    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
 }
 
 static void log_raw(void)
@@ -779,6 +787,9 @@ static void log_raw(void)
     }
     brg_log("[RAW] last EF frame:");
     for (unsigned i = 0; i < FD_RX_FRAME_BYTES; i++) brg_log(" %02x", st.last_ext_raw[i]);
+    brg_log("\n");
+    brg_log("[RAW] last reply (cmd=%02x):", st.last_reply_raw[2]);
+    for (unsigned i = 0; i < FD_RX_FRAME_BYTES; i++) brg_log(" %02x", st.last_reply_raw[i]);
     brg_log("\n");
     uint32_t const raw_now = time_us_32();
     uint32_t const stick_age = sample.sticks_us ? raw_now - sample.sticks_us : 0;
@@ -873,6 +884,7 @@ static void console_task(void)
         switch ((char)c) {
         case 'i': log_status(); break;
         case 'r': flydigi_host_resend_cmds(); brg_log("[CMD] 命令序列已重排\n"); break;
+        case 's': flydigi_host_request_hw_status(); brg_log("[CMD] hw status queued\n"); break;
         case 'A': flydigi_host_acquire_probe(true); brg_log("[CMD] acquire queued\n"); break;
         case 'U': flydigi_host_acquire_probe(false); brg_log("[CMD] release queued\n"); break;
         case 'R': flydigi_host_rumble(255, 255); brg_log("[CMD] rumble test queued\n"); break;

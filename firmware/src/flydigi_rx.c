@@ -66,6 +66,42 @@ bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
     return true;
 }
 
+bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
+                            uint8_t *model, uint8_t *connection, uint16_t *fw_bcd)
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES || model == NULL ||
+        connection == NULL || fw_bcd == NULL) return false;
+    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x01) return false;
+
+    uint8_t checksum = 1;
+    for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
+    if (checksum != buf[FD_RX_FRAME_BYTES - 1]) return false;
+
+    *model = buf[5];
+    *connection = buf[6];
+    *fw_bcd = (uint16_t)((uint16_t)buf[15] << 8 | buf[16]);
+    return true;
+}
+
+bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
+                          uint8_t *report_rate, uint8_t *precision,
+                          uint8_t *sensitivity)
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES || sleep_minutes == NULL ||
+        report_rate == NULL || precision == NULL || sensitivity == NULL) return false;
+    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x03) return false;
+
+    uint8_t checksum = 1;
+    for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
+    if (checksum != buf[FD_RX_FRAME_BYTES - 1]) return false;
+
+    *sleep_minutes = buf[9];
+    *report_rate = buf[10];
+    *precision = buf[11];
+    *sensitivity = buf[12];
+    return true;
+}
+
 bool flydigi_rx_xinput_idle_spike(const uint8_t *buf, size_t len,
                                  const flydigi_rx_state_t *ext, bool ext_recent)
 {

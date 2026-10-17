@@ -84,6 +84,37 @@ int main(void)
     CHECK(merged.lx == 0 && merged.lt == 0 && !merged.guide,
           "两个输入源均过期时释放全部输入");
 
+    /* 设备信息（01）与硬件状态（03）回复解析 */
+    uint8_t info_reply[32] = {0x5a, 0xa5, 0x01, 0x02, 0x00};
+    info_reply[5] = 130;   /* Vader 5 Pro */
+    info_reply[6] = 2;     /* 无线 */
+    info_reply[11] = 0x26; /* 充电中 60% */
+    info_reply[15] = 0x71; info_reply[16] = 0x40;  /* fw 7.1.4.0 */
+    {
+        uint8_t cs = 1;
+        for (unsigned i = 0; i < 31; i++) cs += info_reply[i];
+        info_reply[31] = cs;
+    }
+    uint8_t dev_model = 0, dev_conn = 0;
+    uint16_t dev_fw = 0;
+    CHECK(flydigi_rx_device_info(info_reply, sizeof info_reply, &dev_model, &dev_conn, &dev_fw) &&
+          dev_model == 130 && dev_conn == 2 && dev_fw == 0x7140,
+          "设备信息：型号 130 / 无线 / 固件 7.1.4.0");
+    info_reply[31] ^= 0xff;
+    CHECK(!flydigi_rx_device_info(info_reply, sizeof info_reply, &dev_model, &dev_conn, &dev_fw),
+          "设备信息校验和错误被拒绝");
+    uint8_t hw_reply[32] = {0x5a, 0xa5, 0x03, 0x02, 0x00};
+    hw_reply[9] = 15; hw_reply[10] = 2; hw_reply[11] = 3; hw_reply[12] = 4;
+    {
+        uint8_t cs = 1;
+        for (unsigned i = 0; i < 31; i++) cs += hw_reply[i];
+        hw_reply[31] = cs;
+    }
+    uint8_t sleep_min = 0, rate_field = 0, prec = 0, sens = 0;
+    CHECK(flydigi_rx_hw_status(hw_reply, sizeof hw_reply, &sleep_min, &rate_field, &prec, &sens) &&
+          sleep_min == 15 && rate_field == 2 && prec == 3 && sens == 4,
+          "硬件状态：睡眠 15 分钟 / 报告率字段 2 / 精度 3 / 灵敏度 4");
+
     static const uint8_t trigger_spike[20] = {
         0x00, 0x14, 0x00, 0x00, 0xd6, 0xff,
     };

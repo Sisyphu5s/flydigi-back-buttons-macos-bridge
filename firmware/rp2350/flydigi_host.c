@@ -34,6 +34,8 @@ static uint32_t s_base_us;             /* 最后一次接口 0 有效报文 */
 static uint32_t s_ext_us;              /* 最后一次 EF 帧 */
 static critical_section_t s_state_lock;
 static volatile bool s_resend_requested;
+static volatile bool s_hwinfo_pending;      /* 按需发送 cmd 03（硬件状态） */
+static bool s_hwinfo_auto_done;             /* 开机后自动补发只做一次 */
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_rumble_left, s_rumble_right;
@@ -169,6 +171,11 @@ static void fd_clear_device_state(void)
     g_fd.battery_valid = false;
     g_fd.battery_percent = 0;
     g_fd.battery_state = 0;
+    g_fd.dev_info_valid = false;
+    g_fd.hw_status_valid = false;
+    g_fd.hw_status_replies = 0;
+    s_hwinfo_pending = false;
+    s_hwinfo_auto_done = false;
     g_fd.rumble_ack_left = 0;
     g_fd.rumble_ack_right = 0;
     g_fd.ext_frame_seen = false;
@@ -629,6 +636,27 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             g_fd.takeover_status_replies++;
             g_fd.takeover_enabled = slot->in_buf[9];
         }
+        uint8_t dev_model, dev_connection;
+        uint16_t dev_fw;
+        if (flydigi_rx_device_info(slot->in_buf, FD_RX_FRAME_BYTES,
+                                   &dev_model, &dev_connection, &dev_fw)) {
+            g_fd.dev_model = dev_model;
+            g_fd.dev_connection = dev_connection;
+            g_fd.dev_fw_version = dev_fw;
+            g_fd.dev_info_valid = true;
+        }
+        if (slot->in_buf[2] == 0x03) {
+            uint8_t sleep_min, rate, precision, sensitivity;
+            if (flydigi_rx_hw_status(slot->in_buf, FD_RX_FRAME_BYTES, &sleep_min, &rate,
+                                     &precision, &sensitivity)) {
+                g_fd.hw_sleep_minutes = sleep_min;
+                g_fd.hw_report_rate = rate;
+                g_fd.hw_stick_precision = precision;
+                g_fd.hw_stick_sensitivity = sensitivity;
+                g_fd.hw_status_valid = true;
+                g_fd.hw_status_replies++;
+            }
+        }
         uint8_t battery_percent, power_state;
         if (flydigi_rx_battery_status(slot->in_buf, xferred_bytes,
                                       &battery_percent, &power_state)) {
@@ -771,7 +799,7 @@ static void fd_send_cmds(void)
     acquire_pending = s_acquire_pending;
     acquire_value = s_acquire_value;
     critical_section_exit(&s_state_lock);
-    if (!acquire_pending || s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
+    if ((!acquire_pending && !s_hwinfo_pending) || s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
         if ((int32_t)(now_ms() - s_ex.cmd_next_ms) < 0) return;
     }
     if (!usbh_edpt_claim(s_ex.daddr, s_ex.ep_out)) { g_fd.cmd_claim_fail++; return; }
@@ -784,12 +812,19 @@ static void fd_send_cmds(void)
         memcpy(s_ex.cmd_buf, acquire_cmd, sizeof acquire_cmd);
         s_ex.cmd_buf[4] = acquire_value ? 1u : 0u;
     } else if (s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* Keep the battery fresh without turning the device-info request into
-         * a 2 Hz latency spike.  The receiver stalls its input endpoints for
-         * about 18 ms while handling this command, so after the first valid
-         * reply it is enough to query every few seconds. */
-        static const uint8_t poll_cmd[] = { 0x5a, 0xa5, 0x01, 0x02, 0x03 };
-        memcpy(s_ex.cmd_buf, poll_cmd, sizeof poll_cmd);
+        if (s_hwinfo_pending) {
+            /* 按需读硬件状态（cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
+            static const uint8_t hw_cmd[] = { 0x5a, 0xa5, 0x03, 0x02, 0x05 };
+            memcpy(s_ex.cmd_buf, hw_cmd, sizeof hw_cmd);
+            s_hwinfo_pending = false;
+        } else {
+            /* Keep the battery fresh without turning the device-info request into
+             * a 2 Hz latency spike.  The receiver stalls its input endpoints for
+             * about 18 ms while handling this command, so after the first valid
+             * reply it is enough to query every few seconds. */
+            static const uint8_t poll_cmd[] = { 0x5a, 0xa5, 0x01, 0x02, 0x03 };
+            memcpy(s_ex.cmd_buf, poll_cmd, sizeof poll_cmd);
+        }
     } else if (s_ex.cmd_idx == 4u) {
         /* Captured receiver startup sequence includes this status request
          * between config-data and the test-mode command. */
@@ -820,6 +855,11 @@ static void fd_send_cmds(void)
         bool const battery_valid = g_fd.battery_valid;
         s_ex.cmd_next_ms = now_ms() +
             (battery_valid ? FD_DEVICE_INFO_POLL_MS : FD_DEVICE_INFO_RETRY_MS);
+        /* 开机完成后自动取一次硬件状态（只做一次；失败可用控制台 's' 重试） */
+        if (!s_hwinfo_auto_done) {
+            s_hwinfo_auto_done = true;
+            s_hwinfo_pending = true;
+        }
     } else {
         s_ex.cmd_next_ms = now_ms() + FD_CMD_GAP_MS;
     }
@@ -925,6 +965,11 @@ void flydigi_host_resend_cmds(void)
     critical_section_enter_blocking(&s_state_lock);
     s_resend_requested = true;
     critical_section_exit(&s_state_lock);
+}
+
+void flydigi_host_request_hw_status(void)
+{
+    s_hwinfo_pending = true;
 }
 
 void flydigi_host_acquire_probe(bool acquire)
