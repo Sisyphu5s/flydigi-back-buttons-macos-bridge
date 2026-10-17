@@ -93,8 +93,7 @@
 #define BRIDGE_GAMEPAD_DESC kDescVader2Pro
 #endif
 
-#define HID_REPORT_INTERVAL_US 1000u    /* 1 kHz 桥接节拍 */
-#define HID_KEEPALIVE_US       1000u    /* 无变化时也保持 1 kHz USB 输出 */
+#define HID_REPORT_INTERVAL_US 1000u    /* 传感器通道 1 ms 节拍（gyro/accel 交替各 500 Hz） */
 
 #ifdef BRINGUP_BOOTSEL_FALLBACK_MS
 #define BRINGUP_MS BRINGUP_BOOTSEL_FALLBACK_MS
@@ -103,7 +102,7 @@
 static bool     s_verbose;
 static bool     s_banner_done;
 static uint32_t s_reports_sent;
-static uint32_t s_last_sent_us;
+static uint32_t s_usb_rate;                /* 最近整 1 秒的 gamepad 报文入队数（目标 ≈1000/s） */
 static uint8_t  s_last_rep[VADER2PRO_REPORT_BYTES];
 static uint32_t s_bridge_age_last_us, s_bridge_age_min_us, s_bridge_age_max_us;
 static uint32_t s_bridge_age_samples;
@@ -541,13 +540,14 @@ static void log_status(void)
          st.xitf_num, st.ext_itf_num,
          st.xep_in, st.xep_in_size, st.ext_ep_in, st.ext_ep_in_size,
          st.ext_ep_out, st.ext_ep_out_size);
-    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu\n",
+    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu usb=%lu/s\n",
          (unsigned long)st.xinput_reports, (unsigned long)st.xinput_invalid_buttons,
          (unsigned long)st.ext_reports,
          (unsigned long)st.ext_frames, (unsigned long)st.ext_bad_checksum,
          (unsigned long)st.cmds_sent,
             st.ext_us_stale != 0 && st.ext_us_stale < FD_EXT_FRESH_US ? "yes" : "no",
-            (unsigned long)st.ext_us_stale, (unsigned long)s_reports_sent);
+            (unsigned long)st.ext_us_stale, (unsigned long)s_reports_sent,
+            (unsigned long)s_usb_rate);
     brg_log("[POWER] valid=%d level=%u state=%u updates=%lu rumble=%lu/%lu spikes=%lu xi_dt=%lu..%lu ext_dt=%lu..%lu us\n",
             (int)st.battery_valid, st.battery_percent, st.battery_state,
             (unsigned long)st.battery_updates, (unsigned long)st.rumble_sent,
@@ -595,13 +595,20 @@ static void log_status(void)
 /* ===================== 桥：host 状态 → HID 报文 ===================== */
 static void bridge_task(void)
 {
-    static uint32_t next_us;
-    static uint32_t seen_input_generation;
+    /* 1 kHz 满速输出：HID IN 端点只要有缓冲空出来，就立刻补进“最新状态”。
+     * FS 中断端点由主机至多每 1 ms 轮询一次，所以上限就是 1000 份/秒；
+     * 每次传输完成后微秒级内重新入队，下一次轮询必然拿到新报文，不产生空帧。
+     * 旧实现按 1 ms 栅格 + keepalive 闸门发送：栅格与主机轮询相位打架时
+     * 周期性丢帧（2026-10-17 实测到达率 978.7/s，2.26% 帧为空）。
+     * 注：报文在入队时刻打包，天然携带当时最新输入，时延只会更小。 */
+    static uint32_t rate_window_us;
+    static uint32_t rate_count;
     uint32_t const t = time_us_32();
-    uint32_t const input_generation = flydigi_host_input_generation();
-    bool const timer_due = (int32_t)(t - next_us) >= 0;
-    if (!timer_due && input_generation == seen_input_generation) return;
-    if (timer_due) next_us = t + HID_REPORT_INTERVAL_US;
+    if ((int32_t)(t - rate_window_us) >= 1000000) {
+        s_usb_rate = rate_count;
+        rate_count = 0;
+        rate_window_us = t;
+    }
     if (!tud_hid_ready()) return;
 
     flydigi_rx_state_t rx;
@@ -610,12 +617,10 @@ static void bridge_task(void)
 
     uint8_t rep[VADER2PRO_REPORT_BYTES];
     bridge_pack(&rx, rep);
-    seen_input_generation = input_generation;
 
     bool const sticks_changed = memcmp(rep, s_last_rep, 4) != 0;
     bool const other_changed = memcmp(rep + 4, s_last_rep + 4, sizeof rep - 4) != 0;
     bool const changed = sticks_changed || other_changed;
-    if (!changed && (t - s_last_sent_us) < HID_KEEPALIVE_US) return;
 
 #ifdef GENERIC_PID_PROBE
     uint8_t pid_rep[PID_PROBE_INPUT_BYTES];
@@ -629,8 +634,8 @@ static void bridge_task(void)
     if (sent) {
         memcpy(s_last_rep, rep, sizeof rep);
         vader2pro_set_last_report(rep);
-        s_last_sent_us = t;
         s_reports_sent++;
+        rate_count++;
         /* This is receiver callback to USB queue age, not radio or Mac latency. */
         uint32_t age_us;
         if (bridge_changed_age_us(time_us_32(), &sample, sticks_changed,
