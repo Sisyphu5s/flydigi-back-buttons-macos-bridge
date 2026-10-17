@@ -18,7 +18,7 @@
 #include "bridge_timing.h"
 
 /* 扩展帧新鲜度窗口：超时则视为扩展键全部释放 */
-#define FD_EXT_FRESH_US 250000u
+#define FD_EXT_FRESH_US 50000u
 
 /* The receiver's XInput endpoint carries one complete 20-byte report. */
 #define FD_XINPUT_REPORT_BYTES 20u
@@ -152,6 +152,9 @@ void flydigi_host_resend_cmds(void);
 
 /* 请求一次硬件状态（控制台 's'，cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
 void flydigi_host_request_hw_status(void);
+
+/* 把睡眠定时器置为“永不”（控制台 'S'，cmd 17）= 消除 15 分钟空闲休眠掉线循环 */
+void flydigi_host_request_sleep_never(void);
 
 /* One-shot SDL-style acquire/release probe on the receiver's command endpoint. */
 void flydigi_host_acquire_probe(bool acquire);

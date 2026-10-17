@@ -764,7 +764,7 @@ static void log_banner(void)
     brg_log("identity: VID=%04x PID=%04x bcdDevice=%04x  HID report=%u B, %u bytes\n",
          BRIDGE_USB_VID, BRIDGE_USB_PID, BRIDGE_USB_BCD,
          (unsigned)sizeof(BRIDGE_GAMEPAD_DESC), VADER2PRO_REPORT_BYTES);
-    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
+    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status S=sleep-never R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
 }
 
 static void log_raw(void)
@@ -885,6 +885,7 @@ static void console_task(void)
         case 'i': log_status(); break;
         case 'r': flydigi_host_resend_cmds(); brg_log("[CMD] 命令序列已重排\n"); break;
         case 's': flydigi_host_request_hw_status(); brg_log("[CMD] hw status queued\n"); break;
+        case 'S': flydigi_host_request_sleep_never(); brg_log("[CMD] sleep=never queued\n"); break;
         case 'A': flydigi_host_acquire_probe(true); brg_log("[CMD] acquire queued\n"); break;
         case 'U': flydigi_host_acquire_probe(false); brg_log("[CMD] release queued\n"); break;
         case 'R': flydigi_host_rumble(255, 255); brg_log("[CMD] rumble test queued\n"); break;
