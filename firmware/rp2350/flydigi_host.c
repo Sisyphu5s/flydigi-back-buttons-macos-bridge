@@ -52,6 +52,7 @@ static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_recover_streak;            /* 连续断流恢复次数（输入恢复时归零，用于退避） */
 static uint8_t s_poll_streak;               /* 连续未回应的设备信息轮询数（收到 01 应答归零） */
+static uint32_t s_dev_info_last_ms;         /* 上次收到 01 应答时刻（上线检测用，0=从未） */
 static uint8_t s_rumble_left, s_rumble_right;
 static bool s_rumble_pending;
 static uint8_t s_rumble_buf[8];
@@ -227,6 +228,7 @@ static void fd_clear_device_state(void)
     s_retry_ms = 0;
     s_recover_streak = 0;
     s_poll_streak = 0;
+    s_dev_info_last_ms = 0;
     s_rumble_left = 0;
     s_rumble_right = 0;
     s_rumble_deadline_us = 0;
@@ -713,12 +715,24 @@ static bool fd_ex_set_config(uint8_t dev_addr, uint8_t itf_num)
 /* 0x01 设备信息（型号/连接/固件）与电量 nibble（后者自带 cmd 校验）。 */
 static void fd_reply_01(const uint8_t *b, uint32_t n)
 {
+    (void)n;
     flydigi_dev_info_t ex;
     if (flydigi_rx_device_info_ex(b, FD_RX_FRAME_BYTES, &ex)) {
         g_fd.dev_ext.ex = ex;
         g_fd.dev_ext.valid = true;
         g_fd.dev_ext.replies++;
         s_poll_streak = 0;              /* 收到 01 应答：轮询退避归零 */
+        /* 手柄重新上线检测（2026-10-18）：长时间无 01 应答后重新收到 →
+         * 重置恢复退避并立即安排一次快速恢复（重发启动序列 test-mode + acquire），
+         * 同时补一次配置重读。避免退避到 30s 后手柄回归要等半分钟才恢复 EF。 */
+        uint32_t const now = now_ms();
+        if (s_dev_info_last_ms != 0 &&
+            (int32_t)(now - s_dev_info_last_ms) > 10000) {
+            s_recover_streak = 0;
+            s_retry_ms = 0;
+            s_gcfg_stale = true;
+        }
+        s_dev_info_last_ms = now;
         /* 旧扁平字段由全量解析同步填充（同字节位：model[5]/conn[6]/fw[15..16]）。 */
         g_fd.dev_model = ex.model;
         g_fd.dev_connection = ex.connection;
