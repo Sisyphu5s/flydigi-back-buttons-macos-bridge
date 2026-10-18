@@ -37,7 +37,7 @@ int  brg_tu_log_printf(const char *fmt, ...);
 
 #define CFG_TUD_CDC             1                  /* 控制台（可观测性） */
 #define CFG_TUD_CDC_RX_BUFSIZE  64
-#define CFG_TUD_CDC_TX_BUFSIZE  512
+#define CFG_TUD_CDC_TX_BUFSIZE  4096               /* 心跳状态一次约 900B 突发；512 曾丢 [A0]/[AGE]/[POWER]/[OPEN] 尾部行 */
 #define CFG_TUD_CDC_EP_BUFSIZE  64
 
 #define CFG_TUD_MSC             0

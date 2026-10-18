@@ -162,11 +162,11 @@ void flydigi_host_resend_cmds(void);
 /* 请求一次硬件状态（控制台 's'，cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
 void flydigi_host_request_hw_status(void);
 
-/* 把睡眠定时器置为“永不”（控制台 'S'，cmd 17）= 消除 15 分钟空闲休眠掉线循环 */
-void flydigi_host_request_sleep_never(void);
+/* 写睡眠定时器分钟数（控制台 'S' = 0 永不；0xA0 field 32） */
+void flydigi_host_request_sleep_minutes(uint8_t minutes);
 
-/* 写入报告率（控制台 1/2/4/8，cmd 14）：{1:1000, 2:500, 4:250, 8:125} Hz */
-void flydigi_host_request_report_rate(uint8_t value);
+/* 写报告率 Hz（控制台 1/2/4/8 = 1000/500/250/125；0xA0 field 33，u16LE） */
+void flydigi_host_request_report_rate_hz(uint16_t hz);
 
 /* 读取全局配置（控制台 'g'）：0xA3 分块读 RAM1 → slice(2,82) → 字段解析 */
 void flydigi_host_request_global_config(void);

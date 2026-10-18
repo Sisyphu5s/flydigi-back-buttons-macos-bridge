@@ -65,6 +65,41 @@ function fakeDevice() {
   return device;
 }
 
+/* 构造 GET_GCFG(8) 应答：协议布局见 firmware/rp2350/main.c；
+ * receiveFeatureReport 返回的原始报告 [0] 是 0x11 报告 ID，[i+1] 才对应协议索引 i。 */
+function gcfgResponse(g, request) {
+  const bytes = new Uint8Array(64);
+  const view = new DataView(bytes.buffer);
+  bytes[0] = 0x11;                                        /* 报告 ID */
+  bytes[2] = 1;                                           /* [1] 版本 */
+  view.setUint16(3, g.rate, true);                        /* [2..3] 回报率 Hz */
+  bytes[5] = g.sleep;                                     /* [4] 睡眠分钟 */
+  bytes[6] = (g.valid ? 1 : 0) | (g.thirdparty ? 2 : 0);  /* [5] flags */
+  bytes[7] = g.jsResolution;                              /* [6] 摇杆分辨率 */
+  view.setUint32(8, g.reads, true);                       /* [7..10] 成功读取计数 */
+  view.setUint32(12, g.errors || 0, true);                /* [11..14] 失败计数 */
+  const name = new TextEncoder().encode(g.name || '');    /* [15..30] 名称 */
+  for (let i = 0; i < 16; i++) bytes[16 + i] = name[i] || 0;
+  bytes[32] = 1;                                          /* [31] 本次已排队新读取 */
+  view.setUint32(33, g.a0Replies || 0, true);             /* [32..35] 0xA0 应答计数 */
+  bytes[37] = g.a0Status || 0;                            /* [36] 最近写入状态 */
+  bytes[38] = g.a0Field || 0;                             /* [37] 最近写入字段 */
+  bytes[62] = request[61];
+  bytes[63] = request[62];
+  return new DataView(bytes.buffer);
+}
+
+function gcfgEcho(request) {
+  const bytes = new Uint8Array(64);
+  bytes[0] = 0x11;
+  bytes[2] = 1;
+  bytes[3] = request[1];                                  /* [2..3] 回显 */
+  bytes[4] = request[2];
+  bytes[62] = request[61];
+  bytes[63] = request[62];
+  return new DataView(bytes.buffer);
+}
+
 async function testMismatch() {
   const {element, hid} = setup();
   const device = fakeDevice();
@@ -292,6 +327,111 @@ async function testPersistentAppleProfile() {
   assert.ok(device.sends.some(send => send.bytes[0] === 4));
 }
 
+async function testGcfgReadDisplay() {
+  const {element, hid} = setup();
+  const device = fakeDevice();
+  const receive = device.receiveFeatureReport;
+  const state = {rate: 500, sleep: 15, valid: true, thirdparty: true, jsResolution: 12,
+    reads: 3, errors: 1, name: 'VADER 5 PRO', a0Replies: 2, a0Status: 0, a0Field: 32};
+  device.receiveFeatureReport = async function () {
+    if (this.sends.at(-1).bytes[0] === 8) return gcfgResponse(state, this.sends.at(-1).bytes);
+    return receive.call(this);
+  };
+  hid.nextDevice = device;
+  await element('connect').onclick();
+  assert.equal(element('gcfgRead').disabled, false);
+  await element('gcfgRead').onclick();
+  assert.equal(device.sends.at(-1).bytes[0], 8);
+  assert.match(element('status').textContent, /已读取设备端全局配置/);
+  assert.match(element('gcfgStatus').textContent, /回报率 500 Hz/);
+  assert.match(element('gcfgStatus').textContent, /睡眠 15 分钟/);
+  assert.match(element('gcfgStatus').textContent, /第三方接管 允许/);
+  assert.match(element('gcfgStatus').textContent, /摇杆分辨率 12/);
+  assert.match(element('gcfgStatus').textContent, /名称 VADER 5 PRO/);
+  assert.match(element('gcfgStatus').textContent, /读取 3 次 \/ 错误 1 次/);
+  assert.match(element('gcfgStatus').textContent, /最近写入：睡眠成功/);
+  assert.equal(element('gcfgSleep').value, '15');
+  assert.equal(element('gcfgRate').value, '500');
+  /* flags bit0=0：尚未成功读取过，展示计数并提示稍后重试。 */
+  state.valid = false; state.reads = 0; state.errors = 2; state.a0Replies = 0;
+  await element('gcfgRead').onclick();
+  assert.match(element('gcfgStatus').textContent, /尚未成功读取/);
+  assert.match(element('gcfgStatus').textContent, /读取 0 次 \/ 错误 2 次/);
+  assert.match(element('gcfgStatus').textContent, /已排队新读取/);
+  assert.match(element('status').textContent, /尚未就绪/);
+}
+
+async function testGcfgWriteSync() {
+  const {element, hid} = setup();
+  const device = fakeDevice();
+  const receive = device.receiveFeatureReport;
+  const common = {name: 'PAD', jsResolution: 10, thirdparty: false, errors: 0};
+  /* 三次 GET_GCFG：#1 基线，#2 读取计数未增（旧值），#3 计数增加（新值）。 */
+  const readsQueue = [
+    {reads: 5, sleep: 10, rate: 1000, a0Replies: 0, a0Field: 0, a0Status: 0, valid: true},
+    {reads: 5, sleep: 10, rate: 1000, a0Replies: 0, a0Field: 0, a0Status: 0, valid: true},
+    {reads: 6, sleep: 30, rate: 1000, a0Replies: 1, a0Field: 32, a0Status: 0, valid: true},
+    {reads: 6, sleep: 30, rate: 1000, a0Replies: 1, a0Field: 32, a0Status: 0, valid: true},
+    {reads: 7, sleep: 30, rate: 250, a0Replies: 2, a0Field: 33, a0Status: 0, valid: true},
+  ];
+  let readIndex = 0;
+  device.receiveFeatureReport = async function () {
+    const request = this.sends.at(-1).bytes;
+    if (request[0] === 8)
+      return gcfgResponse(Object.assign({}, common,
+        readsQueue[Math.min(readIndex++, readsQueue.length - 1)]), request);
+    if (request[0] === 9 || request[0] === 10) return gcfgEcho(request);
+    return receive.call(this);
+  };
+  hid.nextDevice = device;
+  await element('connect').onclick();
+  element('gcfgSleep').value = '30';
+  const applying = element('gcfgSleepApply').onclick();
+  await new Promise(r => setTimeout(r, 1));
+  assert.equal(element('gcfgSleepApply').disabled, true);   /* 回读同步期间禁用写入 */
+  assert.equal(element('gcfgSleep').disabled, true);
+  assert.equal(element('gcfgRead').disabled, true);
+  await applying;
+  assert.deepEqual(Array.from(device.sends.find(s => s.bytes[0] === 9).bytes.slice(0, 2)), [9, 30]);
+  assert.match(element('gcfgStatus').textContent, /睡眠 30 分钟/);
+  assert.match(element('gcfgStatus').textContent, /最近写入：睡眠成功/);
+  assert.equal(element('gcfgSleep').value, '30');
+  assert.equal(element('gcfgSleepApply').disabled, false);
+  /* SET_RATE：Hz u16LE 编码 + 回读后展示新值。 */
+  element('gcfgRate').value = '250';
+  await element('gcfgRateApply').onclick();
+  const rateSend = device.sends.find(s => s.bytes[0] === 10).bytes;
+  assert.deepEqual(Array.from(rateSend.slice(0, 3)), [10, 250, 0]);
+  assert.equal(rateSend[1] | rateSend[2] << 8, 250);
+  assert.match(element('gcfgStatus').textContent, /回报率 250 Hz/);
+  assert.equal(element('gcfgRate').value, '250');
+  assert.match(element('status').textContent, /回报率已写入：250 Hz/);
+}
+
+async function testGcfgDisabledState() {
+  const {element, hid, disconnect} = setup();
+  assert.equal(element('gcfgRead').disabled, true);         /* 未连接：全部禁用 */
+  assert.equal(element('gcfgSleepApply').disabled, true);
+  assert.equal(element('gcfgRateApply').disabled, true);
+  assert.equal(element('gcfgSleep').disabled, true);
+  assert.equal(element('gcfgRate').disabled, true);
+  const device = fakeDevice();
+  hid.nextDevice = device;
+  await element('connect').onclick();
+  assert.equal(element('gcfgRead').disabled, false);
+  assert.equal(element('gcfgSleepApply').disabled, false);
+  assert.equal(element('gcfgRateApply').disabled, false);
+  assert.equal(element('gcfgSleep').disabled, false);
+  assert.equal(element('gcfgRate').disabled, false);
+  disconnect(device);
+  assert.equal(element('gcfgRead').disabled, true);
+  assert.equal(element('gcfgSleepApply').disabled, true);
+  assert.equal(element('gcfgRateApply').disabled, true);
+  assert.equal(element('gcfgSleep').disabled, true);
+  assert.equal(element('gcfgRate').disabled, true);
+  assert.equal(element('gcfgStatus').textContent, '设备端配置: -');
+}
+
 async function testDisconnect() {
   const {element, hid, disconnect} = setup();
   const device = fakeDevice();
@@ -324,6 +464,9 @@ async function testDisconnect() {
   await testAppleExtendedMode(1, 26);
   await testAppleExtendedMode(2, 29);
   await testPersistentAppleProfile();
+  await testGcfgReadDisplay();
+  await testGcfgWriteSync();
+  await testGcfgDisabledState();
   await testDisconnect();
-  console.log('bridge-config: token, legacy, radial flags, rumble, telemetry, Apple persistence, reconnect PASS');
+  console.log('bridge-config: token, legacy, radial flags, rumble, telemetry, gcfg read/write sync, Apple persistence, reconnect PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -37,9 +37,12 @@ static volatile bool s_resend_requested;
 static volatile bool s_hwinfo_pending;      /* 按需发送 cmd 03（硬件状态） */
 static bool s_hwinfo_auto_done;             /* 开机后自动补发只做一次 */
 static bool s_acquire_auto_done;            /* 开机自动声明接管（高帧率流）只做一次 */
-static volatile bool s_sleep_never_pending; /* 按需发送 cmd 17（睡眠=永不） */
-static volatile bool s_rate_pending;        /* 按需发送 cmd 14（报告率） */
-static volatile uint8_t s_rate_value;       /* {1:1000, 2:500, 4:250, 8:125} Hz */
+static volatile bool s_sleep_pending;       /* 按需写睡眠（0xA0 field 32） */
+static volatile uint8_t s_sleep_minutes;    /* 0 = 永不 */
+static bool s_sleep_auto_done;              /* 每挂载自愈一次（读到非 0 才写） */
+static volatile bool s_rate_pending;        /* 按需写报告率（0xA0 field 33） */
+static volatile uint16_t s_rate_hz;
+static bool s_gcfg_auto_done;               /* 每挂载自动读一次全局配置 */
 static uint32_t s_acquire_keepalive_ms;     /* 上次 acquire 发送时刻（30s 保活） */
 static volatile bool s_gcfg_pending;        /* 按需启动全局配置读取（0xA3 读 RAM1） */
 static bool s_gcfg_active;                  /* 读取进行中 */
@@ -188,8 +191,10 @@ static void fd_clear_device_state(void)
     s_hwinfo_pending = false;
     s_hwinfo_auto_done = false;
     s_acquire_auto_done = false;
-    s_sleep_never_pending = false;
+    s_sleep_pending = false;
+    s_sleep_auto_done = false;
     s_rate_pending = false;
+    s_gcfg_auto_done = false;
     s_gcfg_pending = false;
     s_gcfg_active = false;
     s_gcfg_waiting = false;
@@ -678,6 +683,12 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
                         g_fd.gcfg = parsed;
                         g_fd.gcfg_valid = true;
                         g_fd.gcfg_reads++;
+                        /* 自愈：睡眠定时器非 0 → 自动写一次“永不”（每挂载一次） */
+                        if (!s_sleep_auto_done && parsed.sleep_minutes != 0) {
+                            s_sleep_auto_done = true;
+                            s_sleep_minutes = 0;
+                            s_sleep_pending = true;
+                        }
                     } else {
                         g_fd.gcfg_errors++;
                     }
@@ -860,7 +871,7 @@ static void fd_send_cmds(void)
     acquire_pending = s_acquire_pending;
     acquire_value = s_acquire_value;
     critical_section_exit(&s_state_lock);
-    if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_never_pending &&
+    if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_pending &&
          !s_rate_pending && !s_gcfg_pending &&
          !(s_gcfg_active && !s_gcfg_waiting)) ||
         s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
@@ -875,36 +886,29 @@ static void fd_send_cmds(void)
                                                'B', 'R', 'G' };
         memcpy(s_ex.cmd_buf, acquire_cmd, sizeof acquire_cmd);
         s_ex.cmd_buf[4] = acquire_value ? 1u : 0u;
-    } else if (s_sleep_never_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 睡眠定时器置“永不”：官方路径 = 0xA0 SetDeviceConfig，fieldId=32(0x20)。
-         * 帧：5A A5 A0 04 20 00 CS（CS=Σ[2..n-1]&0xFF） */
+    } else if (s_sleep_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 睡眠写入：官方路径 = 0xA0 SetDeviceConfig，fieldId=32(0x20)。
+         * 帧：5A A5 A0 04 20 VV CS（VV=分钟数，0=永不） */
         s_ex.cmd_buf[0] = 0x5a;
         s_ex.cmd_buf[1] = 0xa5;
         s_ex.cmd_buf[2] = 0xa0;
         s_ex.cmd_buf[3] = 0x04;
         s_ex.cmd_buf[4] = 0x20;
-        s_ex.cmd_buf[5] = 0x00;              /* 0 = 永不 */
+        s_ex.cmd_buf[5] = s_sleep_minutes;
         uint8_t cs = 0;
         for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
         s_ex.cmd_buf[6] = cs;
-        s_sleep_never_pending = false;
+        s_sleep_pending = false;
     } else if (s_rate_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         /* 报告率写入：官方路径 = 0xA0 fieldId=33(0x21)，载荷 u16LE Hz。
-         * 控制台 1/2/4/8 = 1000/500/250/125 Hz。帧：5A A5 A0 05 21 LL HH CS */
-        uint16_t hz = 1000;
-        switch (s_rate_value) {
-        case 2: hz = 500; break;
-        case 4: hz = 250; break;
-        case 8: hz = 125; break;
-        default: hz = 1000; break;
-        }
+         * 帧：5A A5 A0 05 21 LL HH CS */
         s_ex.cmd_buf[0] = 0x5a;
         s_ex.cmd_buf[1] = 0xa5;
         s_ex.cmd_buf[2] = 0xa0;
         s_ex.cmd_buf[3] = 0x05;
         s_ex.cmd_buf[4] = 0x21;
-        s_ex.cmd_buf[5] = (uint8_t)(hz & 0xffu);
-        s_ex.cmd_buf[6] = (uint8_t)(hz >> 8);
+        s_ex.cmd_buf[5] = (uint8_t)(s_rate_hz & 0xffu);
+        s_ex.cmd_buf[6] = (uint8_t)(s_rate_hz >> 8);
         uint8_t cs = 0;
         for (unsigned i = 2; i <= 6u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
         s_ex.cmd_buf[7] = cs;
@@ -980,6 +984,11 @@ static void fd_send_cmds(void)
         if (!s_hwinfo_auto_done) {
             s_hwinfo_auto_done = true;
             s_hwinfo_pending = true;
+        }
+        /* 开机自动读一次全局配置（填充 [CFG]；睡眠非 0 时会在读取完成后自愈） */
+        if (!s_gcfg_auto_done) {
+            s_gcfg_auto_done = true;
+            s_gcfg_pending = true;
         }
         /* SDL 式接管声明（0x1C）：接收器据此切到高帧率流（EF 实测 97→716 Hz）。
          * 每次挂载/断流恢复只声明一次；接收器会记录占用者（此处为 "BRG"）。 */
@@ -1119,14 +1128,15 @@ void flydigi_host_request_hw_status(void)
     s_hwinfo_pending = true;
 }
 
-void flydigi_host_request_sleep_never(void)
+void flydigi_host_request_sleep_minutes(uint8_t minutes)
 {
-    s_sleep_never_pending = true;
+    s_sleep_minutes = minutes;
+    s_sleep_pending = true;
 }
 
-void flydigi_host_request_report_rate(uint8_t value)
+void flydigi_host_request_report_rate_hz(uint16_t hz)
 {
-    s_rate_value = value;
+    s_rate_hz = hz;
     s_rate_pending = true;
 }
 

@@ -135,6 +135,10 @@ enum {
     CFG_CMD_SAVE = 0x05,
     CFG_CMD_SET_GYRO_BIAS = 0x06,
     CFG_CMD_TEST_RUMBLE = 0x07,
+    /* 官方驱动研究成果落地：全局配置（0xA3 读 / 0xA0 写）WebHID 接口。 */
+    CFG_CMD_GET_GCFG = 0x08,   /* 触发新读取 + 返回缓存（响应布局见下） */
+    CFG_CMD_SET_SLEEP = 0x09,  /* [1]=分钟（0=永不）→ 0xA0 field 32 */
+    CFG_CMD_SET_RATE = 0x0A,   /* [1..2]=Hz u16LE → 0xA0 field 33 */
 };
 
 static bool config_load_flash(void)
@@ -299,6 +303,38 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
     } else if (cmd == CFG_CMD_TEST_RUMBLE && bufsize >= 3u) {
         flydigi_host_rumble(buffer[1], buffer[2]);
         cfg_response_status(0);
+    } else if (cmd == CFG_CMD_GET_GCFG) {
+        fd_host_status_t st;
+        flydigi_host_get(NULL, &st, NULL);
+        flydigi_host_request_global_config();      /* 每次调用都排队一次新读取 */
+        cfg_response_status(0);
+        /* 布局：[2..3]=rate u16LE [4]=sleep [5]=flags(bit0 valid, bit1 3rd-party)
+         * [6]=jsres [7..10]=reads u32 [11..14]=errors u32 [15..30]=name(16B)
+         * [31]=requested [32..35]=a0_replies u32 [36]=a0_status [37]=a0_field */
+        s_cfg_response[2] = (uint8_t)(st.gcfg.report_rate_hz & 0xffu);
+        s_cfg_response[3] = (uint8_t)(st.gcfg.report_rate_hz >> 8);
+        s_cfg_response[4] = st.gcfg.sleep_minutes;
+        s_cfg_response[5] = (uint8_t)((st.gcfg_valid ? 1u : 0u) |
+                                      (st.gcfg.allow_thirdparty ? 2u : 0u));
+        s_cfg_response[6] = st.gcfg.js_resolution;
+        for (unsigned i = 0; i < 4; i++) {
+            s_cfg_response[7 + i] = (uint8_t)(st.gcfg_reads >> (8 * i));
+            s_cfg_response[11 + i] = (uint8_t)(st.gcfg_errors >> (8 * i));
+            s_cfg_response[32 + i] = (uint8_t)(st.a0_replies >> (8 * i));
+        }
+        memcpy(&s_cfg_response[15], st.gcfg.name, 16);
+        s_cfg_response[31] = 1;
+        s_cfg_response[36] = st.a0_last_status;
+        s_cfg_response[37] = st.a0_last_field;
+    } else if (cmd == CFG_CMD_SET_SLEEP && bufsize >= 2u) {
+        flydigi_host_request_sleep_minutes(buffer[1]);
+        cfg_response_status(0);
+        s_cfg_response[2] = buffer[1];
+    } else if (cmd == CFG_CMD_SET_RATE && bufsize >= 3u) {
+        flydigi_host_request_report_rate_hz((uint16_t)(buffer[1] | ((uint16_t)buffer[2] << 8)));
+        cfg_response_status(0);
+        s_cfg_response[2] = buffer[1];
+        s_cfg_response[3] = buffer[2];
     } else {
         cfg_response_status(2);
     }
@@ -899,11 +935,11 @@ static void console_task(void)
         case 'i': log_status(); break;
         case 'r': flydigi_host_resend_cmds(); brg_log("[CMD] 命令序列已重排\n"); break;
         case 's': flydigi_host_request_hw_status(); brg_log("[CMD] hw status queued\n"); break;
-        case 'S': flydigi_host_request_sleep_never(); brg_log("[CMD] sleep=never queued\n"); break;
-        case '1': flydigi_host_request_report_rate(1); brg_log("[CMD] report rate 1000 Hz queued\n"); break;
-        case '2': flydigi_host_request_report_rate(2); brg_log("[CMD] report rate 500 Hz queued\n"); break;
-        case '4': flydigi_host_request_report_rate(4); brg_log("[CMD] report rate 250 Hz queued\n"); break;
-        case '8': flydigi_host_request_report_rate(8); brg_log("[CMD] report rate 125 Hz queued\n"); break;
+        case 'S': flydigi_host_request_sleep_minutes(0); brg_log("[CMD] sleep=never queued\n"); break;
+        case '1': flydigi_host_request_report_rate_hz(1000); brg_log("[CMD] report rate 1000 Hz queued\n"); break;
+        case '2': flydigi_host_request_report_rate_hz(500); brg_log("[CMD] report rate 500 Hz queued\n"); break;
+        case '4': flydigi_host_request_report_rate_hz(250); brg_log("[CMD] report rate 250 Hz queued\n"); break;
+        case '8': flydigi_host_request_report_rate_hz(125); brg_log("[CMD] report rate 125 Hz queued\n"); break;
         case 'g': flydigi_host_request_global_config(); brg_log("[CMD] global config read queued\n"); break;
         case 'A': flydigi_host_acquire_probe(true); brg_log("[CMD] acquire queued\n"); break;
         case 'U': flydigi_host_acquire_probe(false); brg_log("[CMD] release queued\n"); break;

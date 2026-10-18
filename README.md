@@ -59,6 +59,7 @@ picotool load -v -x \
 firmware/probe/apple_controller_status.sh
 swift firmware/probe/gc_watch.swift 4 04b4 2412
 swift firmware/probe/hid_config_probe.swift --apple --status --sensor --rumble-timing
+swift firmware/probe/hid_config_probe.swift --apple --gcfg   # 设备端全局配置（回报率/睡眠）读取
 ```
 
 ### WebHID 配置页
@@ -69,7 +70,7 @@ swift firmware/probe/hid_config_probe.swift --apple --status --sensor --rumble-t
 python3 -m http.server 8765 --directory web
 ```
 
-打开 `http://localhost:8765/bridge-config.html`，授权设备后可查看电量、传感器、输入状态、摇杆死区/曲线、轴方向、按键映射和双马达测试。`gamepad-probe.html` 用于对比标准 Gamepad API 与 WebHID 路径。
+打开 `http://localhost:8765/bridge-config.html`，授权设备后可查看电量、传感器、输入状态、摇杆死区/曲线、轴方向、按键映射、双马达测试，以及**接收器全局配置面板**（读取/写入手柄端回报率与睡眠定时器，经官方 0xA0/0xA3 通道，详见 [`docs/15`](docs/15-官方驱动落地-全局配置读写.md)）。`gamepad-probe.html` 用于对比标准 Gamepad API 与 WebHID 路径。
 
 ### 验证主机代码
 
@@ -151,6 +152,9 @@ docs/08-社区固件参考与GIP可抄清单.md           社区工程矩阵 + O
 docs/09-OGX-Mini-2026与GPTK-Wine链路.md        OGX-Mini-2026 事实 + GIP 安全突破 + GPTK/Wine 层
 docs/10-逆向结果-苹果GIP主机一手证据.md         GCXboxGamepad 拨片绑定链、158 条标识符注册表
 docs/11-苹果设备模型库-M键原生路径.md   ★ 设备模型库、匹配表、模型格式、路线改写 + §8 真机验证结果
+docs/12-固件实现与验证.md                      固件实现逐条记录 + 真机验证日志（持续更新）
+docs/14-社区项目调研-2026-10.md                社区实现事实（acquire 三态、XInput 抑制等）
+docs/15-官方驱动落地-全局配置读写.md   ★ 官方 0xA3 读/0xA0 写路径、真机验证记录、睡眠自愈、WebHID 命令 0x08–0x0A
 firmware/                                     输出侧 + 输入侧可编译实现 + 写固件前的七步主机验证
   verify.sh                                     一键验证（描述符/模型一致性/位级往返/C↔Python 比对/输入侧解析与映射）
   report-verification.md                        验证报告（结论、报文位图、未覆盖项、工具链缺口）
@@ -281,6 +285,16 @@ Apple DTS [说明](https://developer.apple.com/forums/thread/756692)普通 iOS �
 输入回调现通过跨核原子代次通知设备侧：收到有效 EF/XInput 帧或接收器断开时，固件可在原 1 ms 定时检查之前尝试提交变化的 HID 报告；静止状态也以 1 ms 保活，现场测得约 963 个 USB 报告/秒。静置回归未出现误输入，活动状态下的实际延迟改善仍需拨杆采样验证。
 
 CDC 控制台的 `e` 命令会列出最近 64 个输入变化，分别显示 XInput/EF 来源、原始按钮字、归一化位域和摇杆/扳机值；它只记录按键变化或超过 4096 原始计数的轴变化，用于把实体操作与最终 HID 边沿对齐。
+
+## 官方驱动落地：设备端全局配置（2026-10-18）
+
+社区固件没有覆盖的**设备端全局配置**已从官方网页驱动解读并落地，真机验证详见 [`docs/15-官方驱动落地-全局配置读写.md`](docs/15-官方驱动落地-全局配置读写.md)：
+
+- **「1K 回报率」获官方实证**：手柄自身配置值 `usbReturnRateHz = 1000`（读路径 = 官方 `0xA3` 分块读，解析 80 字节 blob）。
+- **睡眠定时器修复换到官方写路径**：`0xA0` 字段写（fieldId 32）把睡眠 `15 分钟 → 永不`，回读闭环；旧 `0x17/0x14` 路径弃用（静默无效）。应答 `status=0 fieldId=32/33` 真机证实。
+- **开机自动读取 + 睡眠自愈**：固件开机自动读一次全局配置（`[CFG]` 状态行）；任何一次成功读取发现睡眠 ≠ 0 时自动写回「永不」（每挂载最多一次）。
+- **WebHID 新命令** `0x08 GET_GCFG / 0x09 SET_SLEEP / 0x0A SET_RATE`，配置页新增「接收器全局配置」面板；探针新增 `--gcfg / --set-sleep=N / --set-rate=N`。
+- **CDC TX 缓冲区 512 → 4096**：修复心跳状态一次约 900B 突发时尾部行（`[A0]/[AGE]/[POWER]/[OPEN]`）被系统性丢弃的问题。
 
 WebHID 配置页现在显示接收器合成后的实时原始按键名，包含 M1–M4、C/Z/LM/RM/O 和 Home。固件在按键位图变化时立即尝试发送状态报告，空闲时每 250 ms 更新；配置接口的 USB 中断轮询间隔为 10 ms。`GET_INFO[15]` 的位 2 标识该能力，旧固件页面显示不支持。状态报告的 `[33..35]` 存放按键位图低 24 位、`[5]` 存放最高位（O）。位图和 HID 映射共用 `bridge_source_buttons()`，便于判断输入是否到达小板。实体按键边沿仍需操作回归。
 

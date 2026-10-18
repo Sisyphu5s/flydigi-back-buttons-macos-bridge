@@ -9,6 +9,11 @@
   ];
   const CMD = 0x10, RESP = 0x11;
   const CFG_SIZE = 59, REPORT_SIZE = 63;
+  /* 设备端全局配置（0xA3 读 / 0xA0 写）WebHID 命令。 */
+  const GCFG_GET = 8, GCFG_SET_SLEEP = 9, GCFG_SET_RATE = 10;
+  const GCFG_POLL_MS = 600, GCFG_POLL_MAX = 8;
+  const GCFG_SLEEP_OPTIONS = [0, 1, 5, 10, 15, 30, 60];
+  const GCFG_RATE_OPTIONS = [1000, 500, 250, 125];
   const names = ['A','B','D-pad Up','X','Y','D-pad Down','LB','RB','D-pad Left','D-pad Right','Select','Start','L3','R3','M1','M2','M3','M4',null,'Home','C','Z','LM','RM','O'];
   const standardSlots = ['A','B','X','Y','LB','RB','LT','RT','Select','Start','L3','R3','D-pad Up','D-pad Down','D-pad Left','D-pad Right','Home','M1','M2','M3','M4','C','Z','LM','RM','O'];
   const vaderSlots = ['A','B','C','X','Y','Z','LB','RB','LM','RM','Select','Start','L3','R3','M1','M2','M3','M4','O','Home'];
@@ -49,7 +54,8 @@
   }
   function updateCommandButtons() {
     $('connect').disabled = operationBusy;
-    for (const id of ['read', 'apply', 'save', 'defaults', 'rumble'])
+    for (const id of ['read', 'apply', 'save', 'defaults', 'rumble',
+                      'gcfgRead', 'gcfgSleepApply', 'gcfgRateApply'])
       $(id).disabled = !configReady || operationBusy;
     $('rumbleStop').disabled = !device?.opened;
     if (appleProfile && !persistentConfigSupported) {
@@ -59,6 +65,8 @@
     for (const control of document.querySelectorAll('section input, #mapping select'))
       control.disabled = !configReady || operationBusy;
     $('freshXinputSticks').disabled = !configReady || operationBusy || !freshAxesSupported;
+    for (const id of ['gcfgSleep', 'gcfgRate'])
+      $(id).disabled = !configReady || operationBusy;
   }
   function setConfigReady(ready) {
     configReady = ready;
@@ -192,6 +200,82 @@
     commandQueue = result.catch(() => {});
     return result;
   }
+
+  /* ---------- 设备端全局配置（GCFG_GET 读缓存并排队新读取） ---------- */
+
+  function parseGcfgResponse(r) {
+    if (r.length < 38) throw new Error('设备配置响应长度不足');
+    if (r[0] !== 0) throw new Error(`设备配置读取失败 (${r[0]})`);
+    const view = new DataView(r.buffer, r.byteOffset, r.length);
+    /* [15..30] 名称 NUL 填充；固件已把非可见字符换成 '.'，这里再去掉 NUL 之后的填充。 */
+    const nul = r.indexOf(0, 15);
+    const stop = nul === -1 || nul > 31 ? 31 : nul;
+    let name = '';
+    for (const byte of r.subarray(15, stop))
+      name += byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.';
+    return {
+      version: r[1],
+      rate: view.getUint16(2, true),
+      sleep: r[4],
+      valid: !!(r[5] & 1),
+      allowThirdparty: !!(r[5] & 2),
+      jsResolution: r[6],
+      reads: view.getUint32(7, true),
+      errors: view.getUint32(11, true),
+      name: name.trim(),
+      readRequested: !!r[31],
+      a0Replies: view.getUint32(32, true),
+      a0Status: r[36],
+      a0Field: r[37],
+    };
+  }
+  function gcfgA0Label(g) {
+    if (!g.a0Replies) return '无记录';
+    const field = g.a0Field === 32 ? '睡眠' : g.a0Field === 33 ? '回报率' : `字段 ${g.a0Field}`;
+    return g.a0Status === 0 ? `${field}成功` : `${field}失败 (${g.a0Status})`;
+  }
+  function refreshGcfgPanel(g) {
+    if (!g.valid) {
+      $('gcfgStatus').textContent =
+        `设备端配置: 尚未成功读取（读取 ${g.reads} 次 / 错误 ${g.errors} 次）| ${g.readRequested ? '已排队新读取，请稍后重试' : '请先连接设备'}`;
+      return;
+    }
+    $('gcfgStatus').textContent =
+      `设备端配置: 回报率 ${g.rate ? `${g.rate} Hz` : '未知'} | 睡眠 ${g.sleep ? `${g.sleep} 分钟` : '永不'} | ` +
+      `第三方接管 ${g.allowThirdparty ? '允许' : '禁用'} | 摇杆分辨率 ${g.jsResolution} | ` +
+      `名称 ${g.name || '未知'} | 读取 ${g.reads} 次 / 错误 ${g.errors} 次 | 最近写入：${gcfgA0Label(g)}`;
+    if (GCFG_SLEEP_OPTIONS.includes(g.sleep)) $('gcfgSleep').value = String(g.sleep);
+    if (GCFG_RATE_OPTIONS.includes(g.rate)) $('gcfgRate').value = String(g.rate);
+  }
+  async function readGcfg() {
+    return parseGcfgResponse(await command(GCFG_GET));
+  }
+  /* 回读同步：GET_GCFG 返回的是“本次新读取之前”的缓存，轮询直到读取计数超过基线。 */
+  async function waitGcfgRead(baselineReads) {
+    let last;
+    for (let attempt = 0; attempt < GCFG_POLL_MAX; attempt++) {
+      last = await readGcfg();
+      if (last.reads > baselineReads) return last;
+      if (attempt + 1 < GCFG_POLL_MAX) await new Promise(resolve => setTimeout(resolve, GCFG_POLL_MS));
+    }
+    refreshGcfgPanel(last);
+    throw new Error('设备配置回读超时，面板显示的可能是旧值');
+  }
+  async function applySleep(minutes) {
+    const before = await readGcfg();
+    const r = await command(GCFG_SET_SLEEP, [minutes]);
+    if (r[0] !== 0) throw new Error(`睡眠写入失败 (${r[0]})`);
+    if (r.length < 3 || r[2] !== minutes) throw new Error('睡眠写入回显不一致，请重新读取');
+    refreshGcfgPanel(await waitGcfgRead(before.reads));
+  }
+  async function applyRate(hz) {
+    const before = await readGcfg();
+    const r = await command(GCFG_SET_RATE, [hz & 0xff, (hz >> 8) & 0xff]);
+    if (r[0] !== 0) throw new Error(`回报率写入失败 (${r[0]})`);
+    if (r.length < 4 || (r[2] | r[3] << 8) !== hz) throw new Error('回报率写入回显不一致，请重新读取');
+    refreshGcfgPanel(await waitGcfgRead(before.reads));
+  }
+
   async function connect() {
     const filters = DEVICES.map(d => ({...d, usagePage: 0xff00, usage: 1}));
     const list = await navigator.hid.requestDevice({filters});
@@ -210,6 +294,7 @@
     previousTelemetry = undefined;
     lastSaveTelemetry = null;
     saveAwaiting = null;
+    $('gcfgStatus').textContent = '设备端配置: -';
     if (!selected.opened) await selected.open();
     assertCurrent(selected, generation);
     updateCommandButtons();
@@ -344,6 +429,21 @@
       setStatus('停振请求已发送');
     } catch (e) { showError(e); }
   };
+  $('gcfgRead').onclick = () => runExclusive(async () => {
+    const g = await readGcfg();
+    refreshGcfgPanel(g);
+    setStatus(g.valid ? '已读取设备端全局配置' : '设备端全局配置尚未就绪（已排队新读取，请稍后重试）');
+  }).catch(showError);
+  $('gcfgSleepApply').onclick = () => runExclusive(async () => {
+    const minutes = Number($('gcfgSleep').value) || 0;
+    await applySleep(minutes);
+    setStatus(`睡眠定时器已写入：${minutes ? `${minutes} 分钟` : '永不'}`);
+  }).catch(showError);
+  $('gcfgRateApply').onclick = () => runExclusive(async () => {
+    const hz = Number($('gcfgRate').value) || 1000;
+    await applyRate(hz);
+    setStatus(`回报率已写入：${hz} Hz`);
+  }).catch(showError);
   $('sensorConnect').onclick = async () => {
     try {
       const filters = DEVICES.map(d => ({...d, usagePage: 0x20, usage: 0x76}));
@@ -391,6 +491,7 @@
         setStatus('设备已断开');
         $('telemetry').textContent = '接收器状态: -';
         $('pressedKeys').textContent = '按键: -';
+        $('gcfgStatus').textContent = '设备端配置: -';
       }
       if (sensorDevice === disconnected) {
         sensorDevice = undefined;

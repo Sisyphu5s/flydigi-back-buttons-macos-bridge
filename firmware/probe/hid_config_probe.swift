@@ -1,5 +1,5 @@
 // hid_config_probe.swift — exercise the same Feature Report path used by WebHID.
-// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save]
+// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save] [--gcfg] [--set-sleep=N] [--set-rate=N]
 import Foundation
 import IOKit.hid
 
@@ -17,6 +17,13 @@ let triggerWaitSeconds = CommandLine.arguments
 let doConfigRoundtrip = CommandLine.arguments.contains("--config-roundtrip")
 let doRejectInvalid = CommandLine.arguments.contains("--reject-invalid")
 let doSave = CommandLine.arguments.contains("--save")
+let gcfgSetSleep = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--set-sleep=") })
+    .flatMap { UInt8($0.dropFirst("--set-sleep=".count)) }
+let gcfgSetRate = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--set-rate=") })
+    .flatMap { UInt16($0.dropFirst("--set-rate=".count)) }
+let doGcfg = CommandLine.arguments.contains("--gcfg") || gcfgSetSleep != nil || gcfgSetRate != nil
 let appleIdentity = CommandLine.arguments.contains("--apple")
 let scufIdentity = CommandLine.arguments.contains("--scuf")
 let stadiaIdentity = CommandLine.arguments.contains("--stadia")
@@ -127,6 +134,47 @@ func configBytes(_ response: [UInt8]?) -> [UInt8]? {
     let offset = response[0] == 0x11 ? 3 : 2
     guard response.count >= offset + 59 else { return nil }
     return Array(response[offset..<(offset + 59)])
+}
+
+/// GET_GCFG（命令 0x08）响应解析：官方 0xA3 读回的设备端全局配置。
+func gcfgFields(_ response: [UInt8]?)
+    -> (rate: UInt16, sleep: UInt8, valid: Bool, third: Bool, jsres: UInt8,
+        reads: UInt32, errors: UInt32, name: String,
+        a0Replies: UInt32, a0Status: UInt8, a0Field: UInt8)? {
+    guard let response = response else { return nil }
+    let off = (response[0] == 0x11 ? 1 : 0) + 2
+    guard response.count >= off + 36 else { return nil }
+    func u32(_ index: Int) -> UInt32 {
+        (0..<4).reduce(UInt32(0)) { $0 | (UInt32(response[index + $1]) << (8 * $1)) }
+    }
+    let nameBytes = response[(off + 13)..<(off + 29)].prefix { $0 != 0 }
+    return (UInt16(response[off]) | UInt16(response[off + 1]) << 8,
+            response[off + 2], response[off + 3] & 1 != 0, response[off + 3] & 2 != 0,
+            response[off + 4], u32(off + 5), u32(off + 9),
+            String(bytes: nameBytes, encoding: .utf8) ?? "",
+            u32(off + 30), response[off + 34], response[off + 35])
+}
+
+func runGcfg() -> Bool {
+    if let minutes = gcfgSetSleep {
+        print("gcfg set sleep: \(minutes) minutes (0 = never)")
+        guard command(0x09, payload: [minutes]) != nil else { return false }
+        usleep(1_200_000)
+    }
+    if let hz = gcfgSetRate {
+        print("gcfg set rate: \(hz) Hz")
+        guard command(0x0A, payload: [UInt8(truncatingIfNeeded: hz),
+                                      UInt8(truncatingIfNeeded: hz >> 8)]) != nil else { return false }
+        usleep(1_200_000)
+    }
+    _ = command(0x08)                     /* 触发新读取；本次返回的是旧缓存 */
+    usleep(2_000_000)                     /* 等 6 块 0xA3 读完（约 0.5 s，留足余量） */
+    guard let fields = gcfgFields(command(0x08)) else { print("gcfg: parse failed"); return false }
+    print(String(format: "gcfg rate=%dHz sleep=%dmin valid=%d thirdparty=%d jsres=%d reads=%d errors=%d a0_replies=%d a0_status=%d a0_field=%d name='%@'",
+                 Int(fields.rate), Int(fields.sleep), fields.valid ? 1 : 0, fields.third ? 1 : 0,
+                 Int(fields.jsres), fields.reads, fields.errors,
+                 fields.a0Replies, Int(fields.a0Status), Int(fields.a0Field), fields.name))
+    return gcfgSetSleep == nil && gcfgSetRate == nil ? fields.valid : true
 }
 
 func crc32(_ bytes: [UInt8]) -> UInt32 {
@@ -399,4 +447,7 @@ if doStatus || doActivity || doSave || doRumbleTiming {
         print("flash save: \(saveOutcome == 2 ? "PASS" : "FAIL")")
         if saveOutcome != 2 { exit(7) }
     }
+}
+if doGcfg {
+    guard runGcfg() else { print("gcfg: FAIL"); exit(14) }
 }
