@@ -432,6 +432,129 @@ async function testGcfgDisabledState() {
   assert.equal(element('gcfgStatus').textContent, '设备端配置: -');
 }
 
+/* ---------- 二次核对新增：设备信息 / 指纹 / 校准 / 切槽 / 分辨率 / 名称 ---------- */
+
+function infoResponse(request) {
+  const bytes = new Uint8Array(64);
+  bytes[0] = 0x11; bytes[2] = 1;
+  bytes[3] = 130;   /* [2] model */
+  bytes[4] = 1;     /* [3] conn */
+  bytes[5] = 100;   /* [4] battery */
+  bytes[6] = 0x45;  /* [5] chips */
+  bytes[7] = 1;     /* [6] gyro */
+  bytes[8] = 0x27;  /* [7] features */
+  [0x7226, 0x0483, 0x3605, 0, 0, 0, 0x1043].forEach((v, i) => {
+    bytes[9 + 2 * i] = v >> 8;         /* [8..21] 7×fw u16BE */
+    bytes[10 + 2 * i] = v & 0xff;
+  });
+  const sku = new TextEncoder().encode('F5');
+  for (let i = 0; i < 20; i++) bytes[23 + i] = sku[i] || 0;   /* [22..41] */
+  bytes[43] = 1;    /* [42] skuValid */
+  bytes[44] = 1;    /* [43] exValid */
+  bytes[62] = request[61]; bytes[63] = request[62];
+  return new DataView(bytes.buffer);
+}
+
+function fpResponse(request) {
+  const bytes = new Uint8Array(64);
+  const view = new DataView(bytes.buffer);
+  bytes[0] = 0x11; bytes[2] = 1;
+  bytes[3] = 1;                                    /* [2] valid */
+  bytes[4] = 1;                                    /* [3] slot */
+  view.setUint16(5, 0xdad9, true);                 /* [4..5] 槽1 CRC16 */
+  view.setUint16(7, 0xcad9, true);                 /* [6..7] 槽2 */
+  view.setUint16(9, 0, true);                      /* [8..9] 槽3 */
+  view.setUint16(11, 0, true);                     /* [10..11] 槽4 */
+  view.setUint16(13, 0xc0c0, true);                /* [12..13] 全局 */
+  view.setUint32(15, 3, true);                     /* [14..17] 推送计数 */
+  bytes[62] = request[61]; bytes[63] = request[62];
+  return new DataView(bytes.buffer);
+}
+
+async function testDeviceInfoPanel() {
+  const {element, hid} = setup();
+  const device = fakeDevice();
+  const receive = device.receiveFeatureReport;
+  device.receiveFeatureReport = async function () {
+    const request = this.sends.at(-1).bytes;
+    if (request[0] === 15) return fpResponse(request);
+    if (request[0] === 11) return infoResponse(request);
+    return receive.call(this);
+  };
+  hid.nextDevice = device;
+  await element('connect').onclick();
+  await element('gcfgFp').onclick();
+  assert.match(element('devInfo').textContent, /SKU F5/);
+  assert.match(element('devInfo').textContent, /固件 主7\.2\.2\.6/);
+  assert.match(element('devInfo').textContent, /能力 IMU\/LED\/Switch\/扳机震动/);
+  assert.match(element('fpStatus').textContent, /活动槽 2/);
+  assert.match(element('fpStatus').textContent, /dad9\/cad9\/0000\/0000/);
+  assert.match(element('fpStatus').textContent, /变更推送 3 次/);
+}
+
+async function testExtrasEncoding() {
+  const {element, hid} = setup();
+  const device = fakeDevice();
+  const receive = device.receiveFeatureReport;
+  const state = {rate: 1000, sleep: 0, valid: true, thirdparty: true, jsResolution: 10,
+    reads: 4, errors: 0, name: ''};
+  let reads = 4;
+  device.receiveFeatureReport = async function () {
+    const request = this.sends.at(-1).bytes;
+    if (request[0] === 8) { reads++; return gcfgResponse(Object.assign({}, state, {reads}), request); }
+    if (request[0] === 15) return fpResponse(request);
+    if (request[0] === 12 || request[0] === 13 || request[0] === 14 || request[0] === 18) {
+      const b = new Uint8Array(64); b[0] = 0x11; b[2] = 1;
+      if (request[0] === 12) b[3] = request[1];
+      if (request[0] === 14) b[3] = request[1];
+      if (request[0] === 18) b[3] = 3;
+      b[62] = request[61]; b[63] = request[62];
+      return new DataView(b.buffer);
+    }
+    return receive.call(this);
+  };
+  hid.nextDevice = device;
+  await element('connect').onclick();
+
+  /* 摇杆分辨率：SET_FIELD [1]=34 [2]=12 [3]=0 */
+  element('gcfgJsres').value = '12';
+  await element('gcfgJsresApply').onclick();
+  const fieldSend = device.sends.filter(s => s.bytes[0] === 12).at(-1).bytes;
+  assert.equal(fieldSend[1], 34);
+  assert.equal(fieldSend[2], 12);
+  assert.equal(fieldSend[3], 0);
+  assert.match(element('status').textContent, /摇杆分辨率已写入：12 bit/);
+
+  /* 校准：开始 [1]=1 / 结束 [1]=0 */
+  await element('calibStart').onclick();
+  assert.equal(device.sends.filter(s => s.bytes[0] === 14).at(-1).bytes[1], 1);
+  assert.match(element('status').textContent, /校准已开始/);
+  await element('calibFinish').onclick();
+  assert.equal(device.sends.filter(s => s.bytes[0] === 14).at(-1).bytes[1], 0);
+  assert.match(element('status').textContent, /校准已结束/);
+
+  /* 切槽：SLOT_SET [1]=2 → 指纹刷新显示活动槽 2 */
+  await element('slotBtn2').onclick();
+  const slotSend = device.sends.filter(s => s.bytes[0] === 13).at(-1).bytes;
+  assert.equal(slotSend[1], 2);
+  assert.match(element('status').textContent, /已切换到配置槽 3/);
+  assert.match(element('fpStatus').textContent, /活动槽 2/);
+
+  /* 名称：SET_NAME 载荷 [1..3]='BRG' */
+  element('gcfgName').value = 'BRG';
+  await element('gcfgNameApply').onclick();
+  const nameSend = device.sends.filter(s => s.bytes[0] === 18).at(-1).bytes;
+  assert.deepEqual(Array.from(nameSend.slice(1, 4)), [0x42, 0x52, 0x47]);
+  assert.match(element('status').textContent, /名称已写入：BRG/);
+}
+
+async function testExtrasDisabledState() {
+  const {element} = setup();
+  for (const id of ['gcfgFp', 'gcfgJsresApply', 'gcfgNameApply',
+                    'slotBtn0', 'slotBtn3', 'calibStart', 'calibFinish'])
+    assert.equal(element(id).disabled, true);
+}
+
 async function testDisconnect() {
   const {element, hid, disconnect} = setup();
   const device = fakeDevice();
@@ -467,6 +590,9 @@ async function testDisconnect() {
   await testGcfgReadDisplay();
   await testGcfgWriteSync();
   await testGcfgDisabledState();
+  await testDeviceInfoPanel();
+  await testExtrasEncoding();
+  await testExtrasDisabledState();
   await testDisconnect();
   console.log('bridge-config: token, legacy, radial flags, rumble, telemetry, gcfg read/write sync, Apple persistence, reconnect PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

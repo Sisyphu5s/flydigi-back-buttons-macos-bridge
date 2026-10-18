@@ -134,6 +134,39 @@ typedef struct {
     uint32_t hid_proto_sent, hid_proto_queue_fail, hid_proto_complete;
     uint8_t  hid_proto_last_itf;
     uint8_t  hid_proto_last_result;
+
+    /* ---- 官方扩展能力（2026-10-18 二次核对落地） ---- */
+    /* 设备信息全量（0x01）。 */
+    bool     dev_ex_valid;
+    flydigi_dev_info_t dev_ex;
+    uint32_t dev_ex_replies;
+    /* SKU 名称（0x0F）。 */
+    bool     sku_valid;
+    uint8_t  sku_value;
+    char     sku_name[21];
+    uint32_t sku_replies;
+    /* 配置指纹（0xA1 查询 + 推送 / 0xA2 切槽应答）。 */
+    bool     fp_valid;
+    uint8_t  fp_active_slot;
+    uint16_t fp_slot_crc[4];
+    uint16_t fp_global_crc;
+    uint32_t fp_replies, fp_push_count;
+    uint32_t slot_replies, slot_switches;
+    /* RAM 元数据（0xA3 子操作 1）。 */
+    uint32_t meta_replies;
+    uint8_t  meta_status, meta_ram, meta_slot;
+    uint16_t meta_len;
+    uint32_t meta_crc32;
+    /* 校准 / 保存 / 重置（0x34 / 0xA7 / 0xAF）。 */
+    uint32_t calib_starts, calib_finishes, calib_replies;
+    uint32_t save_replies, reset_replies;
+    /* 0x11 SET_STATUS（探索）。 */
+    uint32_t status_set_sent;
+    /* 拼接帧嫌疑检测（EF 帧 [13..20] ≈ 最近 XInput 摇杆值）。 */
+    uint32_t ef_splice_suspect;
+    uint8_t  last_splice_raw[FD_RX_FRAME_BYTES];
+    uint32_t ef_zero_imu;
+    uint8_t  last_zero_imu_raw[FD_RX_FRAME_BYTES];
 } fd_host_status_t;
 
 extern volatile fd_host_status_t g_fd;
@@ -170,6 +203,39 @@ void flydigi_host_request_report_rate_hz(uint16_t hz);
 
 /* 读取全局配置（控制台 'g'）：0xA3 分块读 RAM1 → slice(2,82) → 字段解析 */
 void flydigi_host_request_global_config(void);
+
+/* 0x0F：查询 SKU 名称（一次即可）。 */
+void flydigi_host_request_sku(void);
+
+/* 0xA1：查询配置指纹（活动槽 + 槽 CRC16 + 全局 CRC16）；设备变更时会主动推送。 */
+void flydigi_host_request_fingerprint(void);
+
+/* 0xA3 子操作 1：查询 RAM 元数据（长度 + CRC32）。ram_id 1=全局配置 5=映射。 */
+void flydigi_host_request_ram_meta(uint8_t ram_id);
+
+/* 0xA2：切换活动板载配置槽（0..3）。 */
+void flydigi_host_request_switch_slot(uint8_t slot);
+
+/* 0xA7：保存配置到板载（探测用；slot 0..3）。 */
+void flydigi_host_request_save(uint8_t slot);
+
+/* 0xAF：重置配置段（探测用；0..3=用户槽 128=全局 129=出厂 255=全部）。 */
+void flydigi_host_request_reset(uint8_t cfg_id);
+
+/* 0x03 子 1/2：摇杆校准开始/结束（32B 特殊校验帧）。 */
+void flydigi_host_request_calibration(bool start);
+
+/* 0xA0 通用字段写（u8 或 u16LE）：白名单 {20,23,25,32,33,34,38}；37 拒绝。 */
+void flydigi_host_request_field(uint8_t field_id, uint16_t value);
+bool flydigi_host_field_writable(uint8_t field_id);
+
+/* 0xA0 field 1：写设备显示名（最长 16 字节，UTF-8）。 */
+void flydigi_host_request_name(const char *text);
+
+/* 0x11 SET_STATUS（探索）：xinput/dinput/mouse 状态位（255=保持不变）。 */
+void flydigi_host_request_status_set(uint8_t xinput, uint8_t dinput, uint8_t mouse);
+/* 恢复 allowThirdparty=1（仅 0xAF 重置实验后使用）。 */
+void flydigi_host_request_thirdparty_restore(void);
 
 /* One-shot SDL-style acquire/release probe on the receiver's command endpoint. */
 void flydigi_host_acquire_probe(bool acquire);

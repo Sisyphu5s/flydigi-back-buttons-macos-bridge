@@ -77,6 +77,40 @@ bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
 bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
                             uint8_t *model, uint8_t *connection, uint16_t *fw_bcd);
 
+/* 设备信息全量（0x01 应答，官方 Un() 同布局；版本为 u16 大端 BCD，0x7226 → 7.2.2.6）。 */
+typedef struct {
+    uint8_t  model;              /* [5] 130 = Vader 5 Pro */
+    uint8_t  connection;         /* [6] 1=有线 / 2=无线（新架构相反，本机实测 1=无线） */
+    uint32_t mac_le;             /* [7..10] u32LE（本接收器为 0） */
+    uint8_t  battery_byte;       /* [11] 高 nibble 充电状态 / 低 nibble 电量档 */
+    uint8_t  chip_main, chip_recv;   /* [12] 低/高 nibble */
+    uint8_t  gyro_type;          /* [13] 低 nibble */
+    uint16_t fw_main, fw_recv, fw_si, fw_trigger, fw_screen, fw_adc, fw_sstar; /* [15..28] */
+    uint8_t  features;           /* [29] 能力位，bit 含义见 FD_FEATURE_* */
+} flydigi_dev_info_t;
+
+bool flydigi_rx_device_info_ex(const uint8_t *buf, size_t len, flydigi_dev_info_t *out);
+
+#define FD_FEATURE_IMU             0x01u
+#define FD_FEATURE_LED             0x02u
+#define FD_FEATURE_SWITCH          0x04u
+#define FD_FEATURE_SCREEN          0x08u
+#define FD_FEATURE_TRIGGER_HAPTIC  0x10u   /* 扳机触觉（VCM） */
+#define FD_FEATURE_TRIGGER_VIBRATE 0x20u   /* 扳机震动 */
+#define FD_FEATURE_AUDIO           0x40u
+#define FD_FEATURE_HAPTIC          0x80u
+
+/* SKU 名称（0x0F 应答）：payload[0]=value，[1..20]=SKU 字符串。 */
+bool flydigi_rx_sku(const uint8_t *buf, size_t len, uint8_t *value, char out[21]);
+
+/* 配置指纹（0xA1 指纹查询 / 0xA2 切槽应答）：活动槽 + 4×槽 CRC16 + 全局 CRC16。 */
+bool flydigi_rx_fingerprint(const uint8_t *buf, size_t len, uint8_t *active_slot,
+                            uint16_t slot_crc[4], uint16_t *global_crc);
+
+/* RAM 元数据（0xA3 子操作 1）：状态 + ramId + 槽 + 长度 + CRC32。 */
+bool flydigi_rx_ram_meta(const uint8_t *buf, size_t len, uint8_t *status, uint8_t *ram_id,
+                         uint8_t *slot, uint16_t *data_len, uint32_t *crc32);
+
 /* Decode a hardware-status reply (cmd 03): sleep minutes (0 = never), report
  * rate field, stick precision and stick sensitivity (raw device values). */
 bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
@@ -89,11 +123,26 @@ typedef struct {
     uint8_t  sleep_minutes;      /* @3（0 = 永不） */
     bool     allow_thirdparty;   /* @47 == 1 */
     uint8_t  js_resolution;      /* @43：8..12，否则 12 */
+    bool     quick_switch;       /* @4 == 1：FN+ABXY 快速切换板载配置 */
+    bool     js_center_auto;     /* @39 == 1：摇杆自动中心校准 */
+    bool     local_map;          /* @40 == 1：板载映射启用 */
+    bool     xinput_home;        /* @52 == 1：XInput Home 行为 */
     char     name[17];           /* @7..38 UTF-8，取前 16 字节，非可见字符替换为 '.' */
     uint8_t  raw[80];            /* 原始 80 字节（供诊断/差分） */
 } flydigi_gcfg_t;
 
 bool flydigi_gcfg_parse(const uint8_t *blob80, flydigi_gcfg_t *out);
+
+/* 全局配置字段写 fieldId（官方 $i 转发表全表，均经 0xA0 SetDeviceConfig）。 */
+#define FD_FIELD_NAME             1u   /* displayName：文本 */
+#define FD_FIELD_QUICK_SWITCH     20u  /* enableQuickSwitch：u8 */
+#define FD_FIELD_LOCAL_MAP        23u  /* enableLocalMap：u8 */
+#define FD_FIELD_JS_CENTER_AUTO   25u  /* enableJsCenterAutoAdjust：u8 */
+#define FD_FIELD_SLEEP            32u  /* sleepTime：u8（分钟，0=永不） */
+#define FD_FIELD_RATE             33u  /* usbReturnRateHz：u16LE */
+#define FD_FIELD_JS_RESOLUTION    34u  /* jsResolution：u8（8..12） */
+#define FD_FIELD_THIRDPARTY       37u  /* allowThirdparty：u8（勿关：acquire 依赖） */
+#define FD_FIELD_XINPUT_HOME      38u  /* enableXinputHome：u8 */
 
 /* Reject the receiver's observed all-idle XInput packet with both triggers
  * high when a recent EF frame confirms they are released. */

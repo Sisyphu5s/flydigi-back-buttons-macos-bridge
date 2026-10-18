@@ -60,6 +60,7 @@ firmware/probe/apple_controller_status.sh
 swift firmware/probe/gc_watch.swift 4 04b4 2412
 swift firmware/probe/hid_config_probe.swift --apple --status --sensor --rumble-timing
 swift firmware/probe/hid_config_probe.swift --apple --gcfg   # 设备端全局配置（回报率/睡眠）读取
+swift firmware/probe/hid_config_probe.swift --apple --fingerprint --set-field=34,12 --set-name=BRG  # 指纹/字段写/改名
 ```
 
 ### WebHID 配置页
@@ -70,7 +71,7 @@ swift firmware/probe/hid_config_probe.swift --apple --gcfg   # 设备端全局�
 python3 -m http.server 8765 --directory web
 ```
 
-打开 `http://localhost:8765/bridge-config.html`，授权设备后可查看电量、传感器、输入状态、摇杆死区/曲线、轴方向、按键映射、双马达测试，以及**接收器全局配置面板**（读取/写入手柄端回报率与睡眠定时器，经官方 0xA0/0xA3 通道，详见 [`docs/15`](docs/15-官方驱动落地-全局配置读写.md)）。`gamepad-probe.html` 用于对比标准 Gamepad API 与 WebHID 路径。
+打开 `http://localhost:8765/bridge-config.html`，授权设备后可查看电量、传感器、输入状态、摇杆死区/曲线、轴方向、按键映射、双马达测试，以及**接收器全局配置面板**（读取/写入手柄端回报率、睡眠、摇杆分辨率、名称；读取设备信息与配置指纹；切换板载配置槽；摇杆校准）。`gamepad-probe.html` 用于对比标准 Gamepad API 与 WebHID 路径。
 
 ### 验证主机代码
 
@@ -155,6 +156,7 @@ docs/11-苹果设备模型库-M键原生路径.md   ★ 设备模型库、匹配
 docs/12-固件实现与验证.md                      固件实现逐条记录 + 真机验证日志（持续更新）
 docs/14-社区项目调研-2026-10.md                社区实现事实（acquire 三态、XInput 抑制等）
 docs/15-官方驱动落地-全局配置读写.md   ★ 官方 0xA3 读/0xA0 写路径、真机验证记录、睡眠自愈、WebHID 命令 0x08–0x0A
+docs/16-官方命令谱系落地-2026-10.md     ★ 第二轮命令谱系核对：信息/指纹/校准/切槽/保存/重置/字段全表 + 真机实验结论
 firmware/                                     输出侧 + 输入侧可编译实现 + 写固件前的七步主机验证
   verify.sh                                     一键验证（描述符/模型一致性/位级往返/C↔Python 比对/输入侧解析与映射）
   report-verification.md                        验证报告（结论、报文位图、未覆盖项、工具链缺口）
@@ -295,6 +297,18 @@ CDC 控制台的 `e` 命令会列出最近 64 个输入变化，分别显示 XIn
 - **开机自动读取 + 睡眠自愈**：固件开机自动读一次全局配置（`[CFG]` 状态行）；任何一次成功读取发现睡眠 ≠ 0 时自动写回「永不」（每挂载最多一次）。
 - **WebHID 新命令** `0x08 GET_GCFG / 0x09 SET_SLEEP / 0x0A SET_RATE`，配置页新增「接收器全局配置」面板；探针新增 `--gcfg / --set-sleep=N / --set-rate=N`。
 - **CDC TX 缓冲区 512 → 4096**：修复心跳状态一次约 900B 突发时尾部行（`[A0]/[AGE]/[POWER]/[OPEN]`）被系统性丢弃的问题。
+
+## 官方命令谱系第二轮核对（2026-10-18）
+
+对官方驱动做了第二轮命令谱系核对并全量落地，细节与实验记录见 [`docs/16-官方命令谱系落地-2026-10.md`](docs/16-官方命令谱系落地-2026-10.md)：
+
+- **设备信息全量**（`[DEV+]`）：7 个固件版本（主 7.2.2.6 / 接收 / SI / 扳机 / 屏 / ADC / Sstar）、芯片、陀螺仪、**能力位 0x27 = IMU/LED/Switch/扳机震动**、SKU 名称（本机 `F5`）。
+- **配置指纹与推送**（`0xA1`）：活动槽 + 4×槽 CRC16 + 全局 CRC16；设备在配置变更时**主动推送**，固件据此自动重读（`[FP]` 状态行）。切槽（`0xA2`）0↔1 实测无链路影响。
+- **摇杆校准**（`0x03` 子 1/2，官方同款 32B 特殊帧）进配置页/控制台（`c`/`C`）；**名称写入**（field 1）真机落盘；**jsResolution 写入**（`j`+数字，8–12）。
+- **回报率实验结论**：`usbReturnRateHz` 只影响普通模式 USB 侧上报，**与 acquire 高帧率 EF 流（~740/s）无关**（1000/500/250/125 档实测 EF 基本恒定）。
+- **`0xAF` 重置语义**：全局段重置只动 3 字节（快速切换/第三方接管/一个未知字段）；接管位恢复入口 `T`（关掉会断 acquire）。
+- **平台陷阱**：macOS `IOHIDDeviceSetReport` 会剥掉与报告 ID 相同的首字节 —— 协议命令字禁用 `0x10`（名称命令用 `0x12`）。
+- **新增监测**：`[GLTCH]` 行统计"零 IMU / 摇杆吻合"的拼接帧嫌疑（当前为 0；`ef_bad` ~0.6% 为错位拼接帧，校验拦截无影响）。
 
 WebHID 配置页现在显示接收器合成后的实时原始按键名，包含 M1–M4、C/Z/LM/RM/O 和 Home。固件在按键位图变化时立即尝试发送状态报告，空闲时每 250 ms 更新；配置接口的 USB 中断轮询间隔为 10 ms。`GET_INFO[15]` 的位 2 标识该能力，旧固件页面显示不支持。状态报告的 `[33..35]` 存放按键位图低 24 位、`[5]` 存放最高位（O）。位图和 HID 映射共用 `bridge_source_buttons()`，便于判断输入是否到达小板。实体按键边沿仍需操作回归。
 

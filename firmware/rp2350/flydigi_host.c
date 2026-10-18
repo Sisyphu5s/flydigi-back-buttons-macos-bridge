@@ -50,6 +50,31 @@ static bool s_gcfg_waiting;                 /* 有分块请求在途 */
 static uint8_t s_gcfg_chunk;                /* 下一分块索引 */
 static uint8_t s_gcfg_buf[96];              /* 6×16B 拼装缓冲（覆盖 82B 需求） */
 static uint32_t s_gcfg_last_ms;             /* 超时基准 */
+static uint32_t s_gcfg_read_ms;             /* 上次读取完成时刻（A1 推送自动重读的速率限制） */
+static volatile bool s_gcfg_stale;          /* A1 推送：设备端配置已变化，待重读 */
+static bool s_fp_awaiting_reply;            /* 刚发过 0xA1 查询（区分应答与推送） */
+static uint32_t s_fp_push_count;            /* 0xA1 主动推送计数 */
+/* 官方扩展命令（2026-10-18 二次核对）：SKU/指纹/元数据/切槽/保存/重置/校准/状态位/字段写/名称 */
+static volatile bool s_sku_pending;         /* 0x0F */
+static volatile bool s_fp_pending;          /* 0xA1 */
+static volatile bool s_meta_pending;        /* 0xA3 子操作 1 */
+static volatile uint8_t s_meta_ram;         /*    目标 ramId（1=全局配置，5=映射） */
+static volatile bool s_slot_pending;        /* 0xA2 */
+static volatile uint8_t s_slot_value;
+static volatile bool s_save_pending;        /* 0xA7（探测） */
+static volatile uint8_t s_save_slot;
+static volatile bool s_reset_pending;       /* 0xAF（探测） */
+static volatile uint8_t s_reset_value;
+static volatile bool s_calib_pending;       /* 0x34 */
+static volatile bool s_calib_start;
+static volatile bool s_status_set_pending;  /* 0x11（探索） */
+static volatile uint8_t s_status_set_value[3];
+static volatile bool s_field_pending;       /* 0xA0 通用字段写 */
+static volatile uint8_t s_field_id;
+static volatile uint16_t s_field_value;
+static volatile bool s_name_pending;        /* 0xA0 field 1 文本 */
+static char s_name_text[17];
+static uint8_t s_name_len;
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_rumble_left, s_rumble_right;
@@ -198,6 +223,22 @@ static void fd_clear_device_state(void)
     s_gcfg_pending = false;
     s_gcfg_active = false;
     s_gcfg_waiting = false;
+    s_gcfg_stale = false;
+    s_fp_awaiting_reply = false;
+    s_sku_pending = false;
+    s_fp_pending = false;
+    s_meta_pending = false;
+    s_slot_pending = false;
+    s_save_pending = false;
+    s_reset_pending = false;
+    s_calib_pending = false;
+    s_status_set_pending = false;
+    s_field_pending = false;
+    s_name_pending = false;
+    g_fd.sku_valid = false;
+    g_fd.fp_valid = false;
+    g_fd.meta_replies = 0;
+    g_fd.dev_ex_valid = false;
     g_fd.gcfg_valid = false;
     g_fd.gcfg_reads = 0;
     g_fd.gcfg_errors = 0;
@@ -692,13 +733,16 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
                     } else {
                         g_fd.gcfg_errors++;
                     }
+                    s_gcfg_read_ms = now_ms();
                     s_gcfg_active = false;
                 } else if (s_gcfg_chunk >= 6u) {
                     g_fd.gcfg_errors++;     /* 数据不足 82B */
+                    s_gcfg_read_ms = now_ms();
                     s_gcfg_active = false;
                 }
             } else {
                 g_fd.gcfg_errors++;         /* 错误状态或乱序分块 */
+                s_gcfg_read_ms = now_ms();
                 s_gcfg_active = false;
             }
         }
@@ -708,6 +752,59 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             g_fd.a0_last_status = slot->in_buf[5];
             g_fd.a0_last_field = slot->in_buf[6];
         }
+        if (slot->in_buf[2] == 0x0f) {
+            /* SKU 名称应答（官方 Rn 同布局）：payload[0]=value，[1..20]=名称。 */
+            uint8_t val;
+            if (flydigi_rx_sku(slot->in_buf, FD_RX_FRAME_BYTES, &val,
+                               (char *)g_fd.sku_name)) {
+                g_fd.sku_value = val;
+                g_fd.sku_valid = true;
+                g_fd.sku_replies++;
+            }
+        }
+        if (slot->in_buf[2] == 0xa1 || slot->in_buf[2] == 0xa2) {
+            /* 配置指纹：活动槽 + 4×槽 CRC16 + 全局 CRC16。
+             * 0xA1 同时承担「设备端配置变更」的主动推送（官方 Dn 监听同一命令）。 */
+            uint8_t aslot;
+            uint16_t crcs[4], gcrc;
+            if (flydigi_rx_fingerprint(slot->in_buf, FD_RX_FRAME_BYTES, &aslot, crcs, &gcrc)) {
+                g_fd.fp_valid = true;
+                g_fd.fp_active_slot = aslot;
+                for (unsigned i = 0; i < 4u; i++) g_fd.fp_slot_crc[i] = crcs[i];
+                g_fd.fp_global_crc = gcrc;
+                if (slot->in_buf[2] == 0xa1) {
+                    g_fd.fp_replies++;
+                    if (s_fp_awaiting_reply) {
+                        s_fp_awaiting_reply = false;   /* 我方查询的应答 */
+                    } else {
+                        /* 主动推送：设备端配置已变化 → 触发自动重读 */
+                        s_fp_push_count++;
+                        g_fd.fp_push_count = s_fp_push_count;
+                        s_gcfg_stale = true;
+                    }
+                } else {
+                    g_fd.slot_replies++;
+                }
+            }
+        }
+        if (slot->in_buf[2] == 0xa3 && slot->in_buf[3] == 0x01) {
+            /* RAM 元数据（子操作 1）：状态/ramId/槽/长度/CRC32。 */
+            uint8_t mstatus, mram, mslot;
+            uint16_t mlen;
+            uint32_t mcrc;
+            if (flydigi_rx_ram_meta(slot->in_buf, FD_RX_FRAME_BYTES, &mstatus, &mram,
+                                    &mslot, &mlen, &mcrc)) {
+                g_fd.meta_status = mstatus;
+                g_fd.meta_ram = mram;
+                g_fd.meta_slot = mslot;
+                g_fd.meta_len = mlen;
+                g_fd.meta_crc32 = mcrc;
+                g_fd.meta_replies++;
+            }
+        }
+        if (slot->in_buf[2] == 0xa7) g_fd.save_replies++;
+        if (slot->in_buf[2] == 0xaf) g_fd.reset_replies++;
+        if (slot->in_buf[2] == 0x34) g_fd.calib_replies++;
         uint8_t dev_model, dev_connection;
         uint16_t dev_fw;
         if (flydigi_rx_device_info(slot->in_buf, FD_RX_FRAME_BYTES,
@@ -716,6 +813,13 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             g_fd.dev_connection = dev_connection;
             g_fd.dev_fw_version = dev_fw;
             g_fd.dev_info_valid = true;
+            /* 全量信息（7 个固件版本 + 芯片 + 陀螺仪 + 能力位）同步解析。 */
+            flydigi_dev_info_t ex;
+            if (flydigi_rx_device_info_ex(slot->in_buf, FD_RX_FRAME_BYTES, &ex)) {
+                g_fd.dev_ex = ex;
+                g_fd.dev_ex_valid = true;
+                g_fd.dev_ex_replies++;
+            }
         }
         if (slot->in_buf[2] == 0x03) {
             uint8_t sleep_min, rate, precision, sensitivity;
@@ -760,6 +864,37 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             g_fd.ext_frames++;
             g_fd.ext_frame_seen = true;
             memcpy((void *)g_fd.last_ext_raw, slot->in_buf, FD_RX_FRAME_BYTES);
+            /* 拼接帧嫌疑检测（2026-10-18 发现）：接收器偶发把 XInput 载荷拼进
+             * EF 帧；错位版被校验拒绝，对齐版会漏过校验。这里只做识别与计数：
+             *  a) 零 IMU：校验通过的帧但陀螺仪+加速度全零（真机不可能全零）；
+             *  b) 摇杆吻合：EF [13..20] 四 int16 近似等于最近 XInput 摇杆值。 */
+            {
+                const uint8_t *b = slot->in_buf;
+                bool imu_zero = true;
+                for (unsigned i = 17; i < 29u; i++) {
+                    if (b[i] != 0) { imu_zero = false; break; }
+                }
+                if (imu_zero) {
+                    g_fd.ef_zero_imu++;
+                    memcpy((void *)g_fd.last_zero_imu_raw, b, FD_RX_FRAME_BYTES);
+                }
+                if (s_base_us != 0) {
+                    const int32_t xsum = (int32_t)s_base.lx + s_base.ly + s_base.rx + s_base.ry;
+                    if (xsum > 1024 || xsum < -1024) {
+                        int16_t const f0 = (int16_t)(b[13] | ((uint16_t)b[14] << 8));
+                        int16_t const f1 = (int16_t)(b[15] | ((uint16_t)b[16] << 8));
+                        int16_t const f2 = (int16_t)(b[17] | ((uint16_t)b[18] << 8));
+                        int16_t const f3 = (int16_t)(b[19] | ((uint16_t)b[20] << 8));
+                        int32_t const d0 = (int32_t)f0 - s_base.lx, d1 = (int32_t)f1 - s_base.ly;
+                        int32_t const d2 = (int32_t)f2 - s_base.rx, d3 = (int32_t)f3 - s_base.ry;
+                        if (d0 < 256 && d0 > -256 && d1 < 256 && d1 > -256 &&
+                            d2 < 256 && d2 > -256 && d3 < 256 && d3 > -256) {
+                            g_fd.ef_splice_suspect++;
+                            memcpy((void *)g_fd.last_splice_raw, b, FD_RX_FRAME_BYTES);
+                        }
+                    }
+                }
+            }
         } else {
             critical_section_enter_blocking(&s_state_lock);
             g_fd.ext_bad_checksum++;
@@ -871,8 +1006,18 @@ static void fd_send_cmds(void)
     acquire_pending = s_acquire_pending;
     acquire_value = s_acquire_value;
     critical_section_exit(&s_state_lock);
+    /* A1 推送：设备端配置发生变更（含我们自己的成功写入）→ 自动重读一次，
+     * 速率限制 1.5s，避免推送风暴时反复读 6 块。 */
+    if (s_gcfg_stale && !s_gcfg_pending && !s_gcfg_active &&
+        s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT &&
+        (int32_t)(now_ms() - s_gcfg_read_ms) > 1500) {
+        s_gcfg_stale = false;
+        s_gcfg_pending = true;
+    }
     if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_pending &&
-         !s_rate_pending && !s_gcfg_pending &&
+         !s_rate_pending && !s_gcfg_pending && !s_sku_pending && !s_fp_pending &&
+         !s_meta_pending && !s_slot_pending && !s_save_pending && !s_reset_pending &&
+         !s_calib_pending && !s_status_set_pending && !s_field_pending && !s_name_pending &&
          !(s_gcfg_active && !s_gcfg_waiting)) ||
         s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
         if ((int32_t)(now_ms() - s_ex.cmd_next_ms) < 0) return;
@@ -913,6 +1058,128 @@ static void fd_send_cmds(void)
         for (unsigned i = 2; i <= 6u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
         s_ex.cmd_buf[7] = cs;
         s_rate_pending = false;
+    } else if (s_field_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 通用 0xA0 字段写：len = 载荷长度 + 2（u8 → 0x04，u16LE → 0x05）。
+         * 帧：5A A5 A0 04 <fieldId> <v> CS 或 5A A5 A0 05 <fieldId> <lo> <hi> CS */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa0;
+        s_ex.cmd_buf[4] = s_field_id;
+        uint8_t end;
+        if (s_field_id == FD_FIELD_RATE) {
+            s_ex.cmd_buf[3] = 0x05;
+            s_ex.cmd_buf[5] = (uint8_t)(s_field_value & 0xffu);
+            s_ex.cmd_buf[6] = (uint8_t)(s_field_value >> 8);
+            end = 6;
+        } else {
+            s_ex.cmd_buf[3] = 0x04;
+            s_ex.cmd_buf[5] = (uint8_t)(s_field_value & 0xffu);
+            end = 5;
+        }
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= end; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[end + 1] = cs;
+        s_field_pending = false;
+    } else if (s_name_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xA0 field 1：显示名文本（载荷 [01, text...]，NUL 不必填）。 */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa0;
+        s_ex.cmd_buf[3] = (uint8_t)(1u + s_name_len + 2u);
+        s_ex.cmd_buf[4] = 0x01;
+        for (unsigned i = 0; i < s_name_len; i++)
+            s_ex.cmd_buf[5 + i] = (uint8_t)s_name_text[i];
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 4u + s_name_len; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[5 + s_name_len] = cs;
+        s_name_pending = false;
+    } else if (s_sku_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0x0F SKU 名称查询：5A A5 0F 02 11 */
+        static const uint8_t sku_cmd[] = { 0x5a, 0xa5, 0x0f, 0x02, 0x11 };
+        memcpy(s_ex.cmd_buf, sku_cmd, sizeof sku_cmd);
+        s_sku_pending = false;
+    } else if (s_fp_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xA1 配置指纹查询：5A A5 A1 02 A3 */
+        static const uint8_t fp_cmd[] = { 0x5a, 0xa5, 0xa1, 0x02, 0xa3 };
+        memcpy(s_ex.cmd_buf, fp_cmd, sizeof fp_cmd);
+        s_fp_pending = false;
+        s_fp_awaiting_reply = true;
+    } else if (s_meta_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xA3 子操作 1：RAM 元数据（长度 + CRC32）。帧：5A A5 A3 04 01 RR CS */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa3;
+        s_ex.cmd_buf[3] = 0x04;
+        s_ex.cmd_buf[4] = 0x01;
+        s_ex.cmd_buf[5] = s_meta_ram;
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[6] = cs;
+        s_meta_pending = false;
+    } else if (s_slot_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xA2 切换板载配置槽：5A A5 A2 03 SS CS */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa2;
+        s_ex.cmd_buf[3] = 0x03;
+        s_ex.cmd_buf[4] = s_slot_value;
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 4u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[5] = cs;
+        s_slot_pending = false;
+        g_fd.slot_switches++;
+    } else if (s_save_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xA7 保存到板载（官方：payload [01, cfgId]）：5A A5 A7 04 01 SS CS */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa7;
+        s_ex.cmd_buf[3] = 0x04;
+        s_ex.cmd_buf[4] = 0x01;
+        s_ex.cmd_buf[5] = s_save_slot;
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[6] = cs;
+        s_save_pending = false;
+    } else if (s_reset_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0xAF 重置配置段（探测）：5A A5 AF 03 II CS（0-3 用户槽 128 全局 129 出厂 255 全部） */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xaf;
+        s_ex.cmd_buf[3] = 0x03;
+        s_ex.cmd_buf[4] = s_reset_value;
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 4u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[5] = cs;
+        s_reset_pending = false;
+    } else if (s_calib_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 摇杆校准（官方 joystickCalibrationPort）：32B 特殊帧，校验位在末字节。
+         * 开始 = 5A A5 34 04 00 81 03 01 … 结束 = …03 02。 */
+        static const uint8_t calib_head[] = { 0x5a, 0xa5, 0x34, 0x04, 0x00, 0x81, 0x03 };
+        memcpy(s_ex.cmd_buf, calib_head, sizeof calib_head);
+        s_ex.cmd_buf[7] = s_calib_start ? 0x01 : 0x02;
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 30u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[31] = cs;
+        s_calib_pending = false;
+        if (s_calib_start) g_fd.calib_starts++;
+        else g_fd.calib_finishes++;
+    } else if (s_status_set_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 0x11 SET_STATUS（探索）：载荷 [xinput,dinput,keyboard,mouse,thirdparty, 0×22]，
+         * 共 27B；255 = 保持不变；thirdparty 恒 255（acquire 依赖）。 */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0x11;
+        s_ex.cmd_buf[3] = 0x1d;             /* len = 27 + 2 */
+        s_ex.cmd_buf[4] = s_status_set_value[0];
+        s_ex.cmd_buf[5] = s_status_set_value[1];
+        s_ex.cmd_buf[6] = 0xff;             /* keyboardStatus 不动 */
+        s_ex.cmd_buf[7] = s_status_set_value[2];
+        s_ex.cmd_buf[8] = 0xff;             /* allowThirdparty 不动 */
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 30u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[31] = cs;
+        s_status_set_pending = false;
+        g_fd.status_set_sent++;
     } else if ((s_gcfg_pending || (s_gcfg_active && !s_gcfg_waiting)) &&
                s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         /* 全局配置读取：0xA3 READ_CHUNK（ramId=1，16B/块），应答驱动连读。 */
@@ -1138,6 +1405,98 @@ void flydigi_host_request_report_rate_hz(uint16_t hz)
 {
     s_rate_hz = hz;
     s_rate_pending = true;
+}
+
+void flydigi_host_request_sku(void)
+{
+    s_sku_pending = true;
+}
+
+void flydigi_host_request_fingerprint(void)
+{
+    s_fp_pending = true;
+}
+
+void flydigi_host_request_ram_meta(uint8_t ram_id)
+{
+    s_meta_ram = ram_id;
+    s_meta_pending = true;
+}
+
+void flydigi_host_request_switch_slot(uint8_t slot)
+{
+    s_slot_value = (uint8_t)(slot & 0x03u);
+    s_slot_pending = true;
+}
+
+void flydigi_host_request_save(uint8_t slot)
+{
+    s_save_slot = (uint8_t)(slot & 0x03u);
+    s_save_pending = true;
+}
+
+void flydigi_host_request_reset(uint8_t cfg_id)
+{
+    s_reset_value = cfg_id;
+    s_reset_pending = true;
+}
+
+void flydigi_host_request_calibration(bool start)
+{
+    s_calib_start = start;
+    s_calib_pending = true;
+}
+
+bool flydigi_host_field_writable(uint8_t field_id)
+{
+    switch (field_id) {
+    case FD_FIELD_QUICK_SWITCH:
+    case FD_FIELD_LOCAL_MAP:
+    case FD_FIELD_JS_CENTER_AUTO:
+    case FD_FIELD_SLEEP:
+    case FD_FIELD_RATE:
+    case FD_FIELD_JS_RESOLUTION:
+    case FD_FIELD_XINPUT_HOME:
+        return true;
+    default:
+        /* FD_FIELD_THIRDPARTY(37) 会切断 acquire；FD_FIELD_NAME(1) 走文本入口。 */
+        return false;
+    }
+}
+
+void flydigi_host_request_field(uint8_t field_id, uint16_t value)
+{
+    if (!flydigi_host_field_writable(field_id)) return;
+    s_field_id = field_id;
+    s_field_value = value;
+    s_field_pending = true;
+}
+
+void flydigi_host_request_name(const char *text)
+{
+    if (text == NULL) return;
+    unsigned n = 0;
+    for (; n < sizeof s_name_text - 1u && text[n] != '\0'; n++)
+        s_name_text[n] = text[n];
+    s_name_text[n] = '\0';
+    s_name_len = (uint8_t)n;
+    s_name_pending = true;
+}
+
+void flydigi_host_request_status_set(uint8_t xinput, uint8_t dinput, uint8_t mouse)
+{
+    s_status_set_value[0] = xinput;
+    s_status_set_value[1] = dinput;
+    s_status_set_value[2] = mouse;
+    s_status_set_pending = true;
+}
+
+/* 恢复 allowThirdparty=1（0xAF 重置实验的保底路径；acquire 依赖此位）。 */
+void flydigi_host_request_thirdparty_restore(void)
+{
+    s_field_id = FD_FIELD_THIRDPARTY;
+    s_field_value = 1;
+    s_field_pending = true;
 }
 
 void flydigi_host_request_global_config(void)

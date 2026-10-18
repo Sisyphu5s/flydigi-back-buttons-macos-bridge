@@ -85,8 +85,10 @@
   </section>
 
   <section><strong>接收器全局配置</strong>
-    <div class="row"><button id="gcfgRead">读取设备配置</button></div>
+    <div class="row"><button id="gcfgRead">读取设备配置</button><button id="gcfgFp">读取指纹</button></div>
+    <div id="devInfo" class="status">设备信息: -</div>
     <div id="gcfgStatus" class="status">设备端配置: -</div>
+    <div id="fpStatus" class="status">配置指纹: -</div>
     <div class="row">
       <label>睡眠 <select id="gcfgSleep">
         <option value="0">永不</option><option value="1">1 分钟</option><option value="5">5 分钟</option>
@@ -94,15 +96,33 @@
         <option value="60">60 分钟</option>
       </select></label>
       <button id="gcfgSleepApply">写入睡眠</button>
-    </div>
-    <div class="row">
       <label>回报率 <select id="gcfgRate">
         <option value="1000">1000 Hz</option><option value="500">500 Hz</option>
         <option value="250">250 Hz</option><option value="125">125 Hz</option>
       </select></label>
       <button id="gcfgRateApply">写入回报率</button>
     </div>
-    <p class="hint">固件开机自动读取一次；睡眠定时器非 0 时固件每次挂载会自愈写入「永不」。写入经官方 0xA0 通道。</p>
+    <div class="row">
+      <label>摇杆分辨率 <select id="gcfgJsres">
+        <option value="8">8 bit</option><option value="9">9 bit</option><option value="10">10 bit</option>
+        <option value="11">11 bit</option><option value="12">12 bit</option>
+      </select></label>
+      <button id="gcfgJsresApply">写入分辨率</button>
+      <label>名称 <input id="gcfgName" type="text" maxlength="16" size="12" placeholder="（空）"></label>
+      <button id="gcfgNameApply">写入名称</button>
+    </div>
+    <div class="row">
+      <label>配置槽</label>
+      <button id="slotBtn0">槽 1</button><button id="slotBtn1">槽 2</button>
+      <button id="slotBtn2">槽 3</button><button id="slotBtn3">槽 4</button>
+    </div>
+    <div class="row">
+      <label>摇杆校准</label>
+      <button id="calibStart">开始校准</button>
+      <button id="calibFinish">结束校准</button>
+      <span class="hint">开始后请把两个摇杆各方向转动 2-3 圈，再点结束（与官方流程一致）。</span>
+    </div>
+    <p class="hint">固件开机自动读取一次；睡眠定时器非 0 时固件每次挂载会自愈写入「永不」。写入经官方 0xA0 通道；设备端配置变更时设备会主动推送指纹，固件自动重读。</p>
   </section>
 
   <section><strong>按键映射</strong><div id="mapping" class="grid"></div></section>

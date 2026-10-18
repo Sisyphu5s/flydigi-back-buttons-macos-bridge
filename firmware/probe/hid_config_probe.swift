@@ -1,5 +1,5 @@
 // hid_config_probe.swift — exercise the same Feature Report path used by WebHID.
-// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save] [--gcfg] [--set-sleep=N] [--set-rate=N]
+// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save] [--gcfg] [--set-sleep=N] [--set-rate=N] [--set-field=ID,V] [--fingerprint] [--calibrate=start|finish] [--set-name=TEXT]
 import Foundation
 import IOKit.hid
 
@@ -23,6 +23,21 @@ let gcfgSetSleep = CommandLine.arguments
 let gcfgSetRate = CommandLine.arguments
     .first(where: { $0.hasPrefix("--set-rate=") })
     .flatMap { UInt16($0.dropFirst("--set-rate=".count)) }
+let gcfgSetField = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--set-field=") })
+    .flatMap { s -> (UInt8, UInt16)? in
+        let parts = s.dropFirst("--set-field=".count).split(separator: ",")
+        guard parts.count == 2, let f = UInt8(parts[0]), let v = UInt16(parts[1]) else { return nil }
+        return (f, v)
+    }
+let doFingerprint = CommandLine.arguments.contains("--fingerprint")
+let calibArg = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--calibrate=") })
+    .flatMap { $0.dropFirst("--calibrate=".count) }
+let setNameArg = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--set-name=") })
+    .map { String($0.dropFirst("--set-name=".count)) }
+let doExtras = doFingerprint || calibArg != nil || setNameArg != nil || gcfgSetField != nil
 let doGcfg = CommandLine.arguments.contains("--gcfg") || gcfgSetSleep != nil || gcfgSetRate != nil
 let appleIdentity = CommandLine.arguments.contains("--apple")
 let scufIdentity = CommandLine.arguments.contains("--scuf")
@@ -175,6 +190,42 @@ func runGcfg() -> Bool {
                  Int(fields.jsres), fields.reads, fields.errors,
                  fields.a0Replies, Int(fields.a0Status), Int(fields.a0Field), fields.name))
     return gcfgSetSleep == nil && gcfgSetRate == nil ? fields.valid : true
+}
+
+/* 2026-10-18 二次核对新增：通用字段写 / 指纹 / 校准 / 改名。 */
+func runExtras() -> Bool {
+    if let (field, value) = gcfgSetField {
+        print("extras set-field: id=\(field) value=\(value)")
+        guard let r = command(0x0C, payload: [field, UInt8(truncatingIfNeeded: value),
+                                              UInt8(truncatingIfNeeded: value >> 8)]) else { return false }
+        let off = r[0] == 0x11 ? 1 : 0
+        print("extras set-field status=\(r.count > off ? r[off] : 255) field=\(r.count > off + 2 ? r[off + 2] : 0)")
+        usleep(1_000_000)
+    }
+    if let text = setNameArg {
+        let bytes = Array(text.utf8.prefix(16))
+        print("extras set-name: '\(text)' (\(bytes.count)B)")
+        /* 注意：命令字 0x12（曾被 0x10，与报告 ID 相同会被 macOS SetReport 吞掉首字节）。 */
+        guard command(0x12, payload: bytes) != nil else { return false }
+        usleep(1_000_000)
+    }
+    if let mode = calibArg {
+        let start = mode == "start"
+        print("extras calibrate: \(start ? "START" : "FINISH")")
+        guard command(0x0E, payload: [start ? 1 : 0]) != nil else { return false }
+        usleep(1_000_000)
+    }
+    if doFingerprint {
+        guard let r = command(0x0F) else { return false }
+        let off = (r[0] == 0x11 ? 1 : 0) + 2
+        guard r.count >= off + 16 else { print("extras fingerprint: short response"); return false }
+        let crcs = (0..<4).map { UInt16(r[off + 2 + 2 * $0]) | UInt16(r[off + 3 + 2 * $0]) << 8 }
+        print(String(format: "extras fingerprint valid=%d slot=%d crc=%04x/%04x/%04x/%04x global=%04x pushes=%d",
+                     r[off], r[off + 1], crcs[0], crcs[1], crcs[2], crcs[3],
+                     UInt16(r[off + 10]) | UInt16(r[off + 11]) << 8,
+                     Int(r[off + 12]) | Int(r[off + 13]) << 8 | Int(r[off + 14]) << 16 | Int(r[off + 15]) << 24))
+    }
+    return true
 }
 
 func crc32(_ bytes: [UInt8]) -> UInt32 {
@@ -450,4 +501,7 @@ if doStatus || doActivity || doSave || doRumbleTiming {
 }
 if doGcfg {
     guard runGcfg() else { print("gcfg: FAIL"); exit(14) }
+}
+if doExtras {
+    guard runExtras() else { print("extras: FAIL"); exit(15) }
 }

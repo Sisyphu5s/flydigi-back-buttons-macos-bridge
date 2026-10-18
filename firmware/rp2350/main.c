@@ -139,6 +139,13 @@ enum {
     CFG_CMD_GET_GCFG = 0x08,   /* 触发新读取 + 返回缓存（响应布局见下） */
     CFG_CMD_SET_SLEEP = 0x09,  /* [1]=分钟（0=永不）→ 0xA0 field 32 */
     CFG_CMD_SET_RATE = 0x0A,   /* [1..2]=Hz u16LE → 0xA0 field 33 */
+    /* 2026-10-18 二次核对：官方扩展命令 */
+    CFG_CMD_GET_DEVICE_INFO = 0x0B,  /* 全量设备信息 + SKU（缓存） */
+    CFG_CMD_SET_FIELD = 0x0C,        /* [1]=fieldId [2..3]=u16LE（白名单 {20,23,25,32,33,34,38}） */
+    CFG_CMD_SWITCH_SLOT = 0x0D,      /* [1]=槽位 0..3（0xA2） */
+    CFG_CMD_CALIBRATE = 0x0E,        /* [1]=1 开始 / 0 结束（0x34 特殊帧） */
+    CFG_CMD_GET_FINGERPRINT = 0x0F,  /* 触发 0xA1 查询 + 返回缓存 */
+    CFG_CMD_SET_NAME = 0x12,         /* [1..n]=文本（≤16B）→ 0xA0 field 1（避让 0x10：macOS SetReport 会吞掉与报告 ID 相同的首字节） */
 };
 
 static bool config_load_flash(void)
@@ -308,14 +315,19 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
         flydigi_host_get(NULL, &st, NULL);
         flydigi_host_request_global_config();      /* 每次调用都排队一次新读取 */
         cfg_response_status(0);
-        /* 布局：[2..3]=rate u16LE [4]=sleep [5]=flags(bit0 valid, bit1 3rd-party)
+        /* 布局：[2..3]=rate u16LE [4]=sleep [5]=flags(bit0 valid, bit1 3rd-party,
+         * bit2 快速切换, bit3 摇杆自动中心校准, bit4 板载映射, bit5 XInputHome)
          * [6]=jsres [7..10]=reads u32 [11..14]=errors u32 [15..30]=name(16B)
          * [31]=requested [32..35]=a0_replies u32 [36]=a0_status [37]=a0_field */
         s_cfg_response[2] = (uint8_t)(st.gcfg.report_rate_hz & 0xffu);
         s_cfg_response[3] = (uint8_t)(st.gcfg.report_rate_hz >> 8);
         s_cfg_response[4] = st.gcfg.sleep_minutes;
         s_cfg_response[5] = (uint8_t)((st.gcfg_valid ? 1u : 0u) |
-                                      (st.gcfg.allow_thirdparty ? 2u : 0u));
+                                      (st.gcfg.allow_thirdparty ? 2u : 0u) |
+                                      (st.gcfg.quick_switch ? 4u : 0u) |
+                                      (st.gcfg.js_center_auto ? 8u : 0u) |
+                                      (st.gcfg.local_map ? 16u : 0u) |
+                                      (st.gcfg.xinput_home ? 32u : 0u));
         s_cfg_response[6] = st.gcfg.js_resolution;
         for (unsigned i = 0; i < 4; i++) {
             s_cfg_response[7 + i] = (uint8_t)(st.gcfg_reads >> (8 * i));
@@ -335,8 +347,88 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
         cfg_response_status(0);
         s_cfg_response[2] = buffer[1];
         s_cfg_response[3] = buffer[2];
+    } else if (cmd == CFG_CMD_GET_DEVICE_INFO) {
+        fd_host_status_t st;
+        flydigi_host_get(NULL, &st, NULL);
+        flydigi_host_request_sku();                /* 顺带刷新 SKU */
+        cfg_response_status(0);
+        /* 布局：[2]=model [3]=conn [4]=battery [5]=chips(lo=main hi=recv)
+         * [6]=gyro_type [7]=features [8..21]=7×fw u16BE
+         * [22..41]=SKU 20B [42]=sku_valid [43]=ex_valid */
+        const flydigi_dev_info_t *d = &st.dev_ex;
+        s_cfg_response[2] = st.dev_model;
+        s_cfg_response[3] = st.dev_connection;
+        s_cfg_response[4] = st.battery_valid ? st.battery_percent : 0xffu;
+        s_cfg_response[5] = (uint8_t)(d->chip_main | (d->chip_recv << 4));
+        s_cfg_response[6] = d->gyro_type;
+        s_cfg_response[7] = d->features;
+        s_cfg_response[8] = (uint8_t)(d->fw_main >> 8);
+        s_cfg_response[9] = (uint8_t)d->fw_main;
+        s_cfg_response[10] = (uint8_t)(d->fw_recv >> 8);
+        s_cfg_response[11] = (uint8_t)d->fw_recv;
+        s_cfg_response[12] = (uint8_t)(d->fw_si >> 8);
+        s_cfg_response[13] = (uint8_t)d->fw_si;
+        s_cfg_response[14] = (uint8_t)(d->fw_trigger >> 8);
+        s_cfg_response[15] = (uint8_t)d->fw_trigger;
+        s_cfg_response[16] = (uint8_t)(d->fw_screen >> 8);
+        s_cfg_response[17] = (uint8_t)d->fw_screen;
+        s_cfg_response[18] = (uint8_t)(d->fw_adc >> 8);
+        s_cfg_response[19] = (uint8_t)d->fw_adc;
+        s_cfg_response[20] = (uint8_t)(d->fw_sstar >> 8);
+        s_cfg_response[21] = (uint8_t)d->fw_sstar;
+        if (st.sku_valid) memcpy(&s_cfg_response[22], st.sku_name, 20);
+        s_cfg_response[42] = st.sku_valid ? 1u : 0u;
+        s_cfg_response[43] = st.dev_ex_valid ? 1u : 0u;
+    } else if (cmd == CFG_CMD_SET_FIELD && bufsize >= 3u) {
+        uint8_t const field = buffer[1];
+        uint16_t const value = (uint16_t)(buffer[2] | ((uint16_t)buffer[3] << 8));
+        if (flydigi_host_field_writable(field)) {
+            flydigi_host_request_field(field, value);
+            cfg_response_status(0);
+            s_cfg_response[2] = field;
+        } else {
+            cfg_response_status(3);   /* 字段不在白名单（37/1 走专用入口） */
+            s_cfg_response[2] = field;
+        }
+    } else if (cmd == CFG_CMD_SWITCH_SLOT && bufsize >= 2u) {
+        flydigi_host_request_switch_slot(buffer[1]);
+        cfg_response_status(0);
+        s_cfg_response[2] = (uint8_t)(buffer[1] & 0x03u);
+    } else if (cmd == CFG_CMD_CALIBRATE && bufsize >= 2u) {
+        flydigi_host_request_calibration(buffer[1] != 0);
+        cfg_response_status(0);
+        s_cfg_response[2] = buffer[1] ? 1u : 0u;
+    } else if (cmd == CFG_CMD_GET_FINGERPRINT) {
+        fd_host_status_t st;
+        flydigi_host_get(NULL, &st, NULL);
+        flydigi_host_request_fingerprint();        /* 触发新查询 */
+        cfg_response_status(0);
+        /* 布局：[2]=valid [3]=active_slot [4..11]=槽 CRC16×4 LE
+         * [12..13]=全局 CRC16 LE [14..17]=push 计数 u32 */
+        s_cfg_response[2] = st.fp_valid ? 1u : 0u;
+        s_cfg_response[3] = st.fp_active_slot;
+        for (unsigned i = 0; i < 4u; i++) {
+            s_cfg_response[4 + 2 * i] = (uint8_t)(st.fp_slot_crc[i] & 0xffu);
+            s_cfg_response[5 + 2 * i] = (uint8_t)(st.fp_slot_crc[i] >> 8);
+        }
+        s_cfg_response[12] = (uint8_t)(st.fp_global_crc & 0xffu);
+        s_cfg_response[13] = (uint8_t)(st.fp_global_crc >> 8);
+        for (unsigned i = 0; i < 4u; i++)
+            s_cfg_response[14 + i] = (uint8_t)(st.fp_push_count >> (8 * i));
+    } else if (cmd == CFG_CMD_SET_NAME && bufsize >= 2u) {
+        char text[17];
+        unsigned n = 0;
+        for (; n < 16u && (1u + n) < bufsize && buffer[1 + n] != 0; n++)
+            text[n] = (char)buffer[1 + n];
+        text[n] = '\0';
+        flydigi_host_request_name(text);
+        cfg_response_status(0);
+        s_cfg_response[2] = (uint8_t)n;
     } else {
         cfg_response_status(2);
+        /* 诊断：回显桥实际看到的命令字与报告长度（排查未知命令）。 */
+        s_cfg_response[2] = cmd;
+        s_cfg_response[3] = (uint8_t)(bufsize > 255u ? 255u : bufsize);
     }
     s_cfg_response[BRIDGE_CONFIG_TOKEN_OFFSET] =
         bufsize > BRIDGE_CONFIG_TOKEN_OFFSET ? buffer[BRIDGE_CONFIG_TOKEN_OFFSET] : 0;
@@ -595,11 +687,47 @@ static void log_status(void)
             st.hw_sleep_minutes, st.hw_report_rate,
             st.hw_stick_precision, st.hw_stick_sensitivity,
             (unsigned long)st.hw_status_replies);
+    /* 全量设备信息（0x01 二段）：7 个固件版本 + 芯片 + 陀螺仪 + 能力位 + SKU。 */
+    if (st.dev_ex_valid) {
+        const flydigi_dev_info_t *d = &st.dev_ex;
+        brg_log("[DEV+] fwm=%04x fwr=%04x fwsi=%04x fwt=%04x fws=%04x fwa=%04x fwsst=%04x chip=%u/%u gyro=%u feat=%02x%s%s%s%s%s%s%s%s sku=%s\n",
+                d->fw_main, d->fw_recv, d->fw_si, d->fw_trigger, d->fw_screen,
+                d->fw_adc, d->fw_sstar, d->chip_main, d->chip_recv, d->gyro_type,
+                d->features,
+                (d->features & FD_FEATURE_IMU) ? " IMU" : "",
+                (d->features & FD_FEATURE_LED) ? " LED" : "",
+                (d->features & FD_FEATURE_SWITCH) ? " SW" : "",
+                (d->features & FD_FEATURE_SCREEN) ? " SCR" : "",
+                (d->features & FD_FEATURE_TRIGGER_HAPTIC) ? " TRG-HAP" : "",
+                (d->features & FD_FEATURE_TRIGGER_VIBRATE) ? " TRG-VIB" : "",
+                (d->features & FD_FEATURE_AUDIO) ? " AUD" : "",
+                (d->features & FD_FEATURE_HAPTIC) ? " HAP" : "",
+                st.sku_valid ? st.sku_name : "?");
+    } else {
+        brg_log("[DEV+] (未收到全量设备信息)\n");
+    }
     /* 全局配置 blob（0xA3 读回，官方字段语义）：'g' 触发一次读取后刷新 */
-    brg_log("[CFG] rate=%uHz sleep_min=%u thirdparty=%u jsres=%u name=%s reads=%lu err=%lu\n",
+    brg_log("[CFG] rate=%uHz sleep_min=%u thirdparty=%u jsres=%u qsw=%u jsauto=%u lmap=%u xhome=%u name=%s reads=%lu err=%lu\n",
             st.gcfg.report_rate_hz, st.gcfg.sleep_minutes,
-            st.gcfg.allow_thirdparty ? 1u : 0u, st.gcfg.js_resolution, st.gcfg.name,
+            st.gcfg.allow_thirdparty ? 1u : 0u, st.gcfg.js_resolution,
+            st.gcfg.quick_switch ? 1u : 0u, st.gcfg.js_center_auto ? 1u : 0u,
+            st.gcfg.local_map ? 1u : 0u, st.gcfg.xinput_home ? 1u : 0u,
+            st.gcfg.name,
             (unsigned long)st.gcfg_reads, (unsigned long)st.gcfg_errors);
+    /* 配置指纹（0xA1/A2）+ RAM 元数据（0xA3 子 1）+ 写入计数。 */
+    brg_log("[FP] slot=%u crc=%04x/%04x/%04x/%04x g=%04x pushes=%lu meta=%02x r%u len=%u crc32=%08lx sw=%lu sv=%lu rs=%lu cal=%lu/%lu/%lu\n",
+            st.fp_active_slot, st.fp_slot_crc[0], st.fp_slot_crc[1],
+            st.fp_slot_crc[2], st.fp_slot_crc[3], st.fp_global_crc,
+            (unsigned long)st.fp_push_count, st.meta_status, st.meta_ram,
+            st.meta_len, (unsigned long)st.meta_crc32,
+            (unsigned long)st.slot_switches, (unsigned long)st.save_replies,
+            (unsigned long)st.reset_replies, (unsigned long)st.calib_starts,
+            (unsigned long)st.calib_finishes, (unsigned long)st.calib_replies);
+    /* 拼接帧嫌疑（接收器偶发把 XInput 载荷拼进 EF 帧）。 */
+    brg_log("[GLTCH] zero_imu=%lu splice=%lu sp=%02x%02x%02x%02x\n",
+            (unsigned long)st.ef_zero_imu, (unsigned long)st.ef_splice_suspect,
+            st.last_splice_raw[13], st.last_splice_raw[14],
+            st.last_splice_raw[15], st.last_splice_raw[16]);
     /* 官方字段写（0xA0）应答：'S'=field32 睡眠；1/2/4/8=field33 回报率 */
     brg_log("[A0] replies=%lu status=%u field=%u\n",
             (unsigned long)st.a0_replies, st.a0_last_status, st.a0_last_field);
@@ -927,8 +1055,56 @@ static void log_pio_in(void)
             (unsigned long)st.cmd_claim_fail, (unsigned long)st.cmd_xfer_fail);
 }
 
+/* 取活动槽（1..4）：指纹有效时返回 slot+1，否则 0。 */
+static unsigned st_fp_slot_for_save(void)
+{
+    fd_host_status_t st;
+    flydigi_host_get(NULL, &st, NULL);
+    return st.fp_valid ? (unsigned)st.fp_active_slot + 1u : 0u;
+}
+
 static void console_task(void)
 {
+    /* 两键参数命令（'k'+槽位 1 位；'j'+分辨率 1-2 位）：收数字，
+     * 满位/非数字/超时即结算。参数模式下暂不处理其它键。 */
+    static char s_arg_key;
+    static char s_arg_buf[3];
+    static uint8_t s_arg_len;
+    static uint32_t s_arg_deadline;
+    if (s_arg_key != 0) {
+        uint32_t const now = to_ms_since_boot(get_absolute_time());
+        int32_t const ch = tud_cdc_read_char();
+        bool settle = false;
+        if (ch >= 0 && ch >= '0' && ch <= '9' && s_arg_len < 2u) {
+            s_arg_buf[s_arg_len++] = (char)ch;
+            s_arg_deadline = now + 400u;
+            if (s_arg_len >= 2u) settle = true;
+        } else if (ch >= 0) {
+            settle = true;                       /* 非数字：按已收内容结算 */
+        } else if ((int32_t)(now - s_arg_deadline) >= 0) {
+            settle = true;                       /* 超时 */
+        }
+        if (s_arg_key == 'k' && s_arg_len >= 1u) settle = true;  /* 槽位只收 1 位 */
+        if (settle) {
+            s_arg_buf[s_arg_len] = '\0';
+            unsigned val = 0;
+            for (uint8_t i = 0; i < s_arg_len; i++)
+                val = val * 10u + (unsigned)(s_arg_buf[i] - '0');
+            if (s_arg_key == 'k' && val >= 1u && val <= 4u) {
+                flydigi_host_request_switch_slot((uint8_t)(val - 1u));
+                brg_log("[CMD] switch slot %u queued\n", val);
+            } else if (s_arg_key == 'j' && val >= 8u && val <= 12u) {
+                flydigi_host_request_field(FD_FIELD_JS_RESOLUTION, (uint16_t)val);
+                brg_log("[CMD] jsResolution=%u queued\n", val);
+            } else {
+                brg_log("[CMD] 参数无效（k:1..4 / j:8..12），已取消\n");
+            }
+            s_arg_key = 0;
+            s_arg_len = 0;
+        }
+        return;
+    }
+
     int32_t c;
     while ((c = tud_cdc_read_char()) >= 0) {
         switch ((char)c) {
@@ -944,6 +1120,44 @@ static void console_task(void)
         case 'A': flydigi_host_acquire_probe(true); brg_log("[CMD] acquire queued\n"); break;
         case 'U': flydigi_host_acquire_probe(false); brg_log("[CMD] release queued\n"); break;
         case 'R': flydigi_host_rumble(255, 255); brg_log("[CMD] rumble test queued\n"); break;
+        /* ---- 2026-10-18 二次核对新增：官方扩展命令 ---- */
+        case 'F': flydigi_host_request_sku(); flydigi_host_request_fingerprint();
+                  brg_log("[CMD] SKU + fingerprint queued\n"); break;
+        case 'K': flydigi_host_request_fingerprint(); brg_log("[CMD] fingerprint queued\n"); break;
+        case 'm': flydigi_host_request_ram_meta(1); brg_log("[CMD] ram meta (ram1) queued\n"); break;
+        case 'c': flydigi_host_request_calibration(true); brg_log("[CMD] calibration START queued（转动两摇杆各方向）\n"); break;
+        case 'C': flydigi_host_request_calibration(false); brg_log("[CMD] calibration FINISH queued\n"); break;
+        case 'w': {
+            unsigned const slot = st_fp_slot_for_save();
+            if (slot) {
+                flydigi_host_request_save((uint8_t)(slot - 1u));
+                brg_log("[CMD] save to slot %u queued\n", slot);
+            } else {
+                brg_log("[CMD] 先按 K 读指纹（需要活动槽）\n");
+            }
+            break;
+        }
+        case 'k': s_arg_key = 'k'; s_arg_len = 0; s_arg_deadline = to_ms_since_boot(get_absolute_time()) + 400u;
+                  brg_log("[CMD] 槽位? （1..4）\n"); return;   /* 交回参数模式，防止后续数字被主开关吞掉 */
+        case 'j': s_arg_key = 'j'; s_arg_len = 0; s_arg_deadline = to_ms_since_boot(get_absolute_time()) + 400u;
+                  brg_log("[CMD] jsResolution? （8..12）\n"); return;
+        case 'T': flydigi_host_request_thirdparty_restore();
+                  brg_log("[CMD] allowThirdparty=1 restore queued（0xAF 重置实验保底）\n"); break;
+        case 'Z': {
+            /* 双按确认：Z Z（3 秒内）→ 0xAF 重置「全局配置」段（cfgId=128）。
+             * 仅全局段（可完整回读恢复）；用户槽/出厂/全部重置只在探针里。 */
+            static uint32_t s_z_arm_ms;
+            uint32_t const now_ms = to_ms_since_boot(get_absolute_time());
+            if (s_z_arm_ms != 0 && (int32_t)(now_ms - s_z_arm_ms) < 3000) {
+                s_z_arm_ms = 0;
+                flydigi_host_request_reset(128);
+                brg_log("[CMD] RESET global config queued\n");
+            } else {
+                s_z_arm_ms = now_ms;
+                brg_log("[CMD] 再按一次 Z 确认重置全局配置（3 秒内；g 回读 / T 恢复接管位）\n");
+            }
+            break;
+        }
         case 'x': log_raw(); break;
         case 'e': log_events(); break;
         case 'q': log_pio_in(); break;

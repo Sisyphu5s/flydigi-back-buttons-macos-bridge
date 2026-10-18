@@ -103,6 +103,67 @@ int main(void)
     info_reply[31] ^= 0xff;
     CHECK(!flydigi_rx_device_info(info_reply, sizeof info_reply, &dev_model, &dev_conn, &dev_fw),
           "设备信息校验和错误被拒绝");
+    /* 全量设备信息（0x01 二段）：真机帧（2026-10-18 本机接收器 7.2.2.6） */
+    static const uint8_t info_full[32] = {
+        0x5a, 0xa5, 0x01, 0x01, 0x00, 0x82, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x0a, 0x45, 0x01, 0x00, 0x72, 0x26, 0x04, 0x83, 0x36,
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x43, 0x27,
+        0x00, 0xa9,
+    };
+    flydigi_dev_info_t dinfo;
+    CHECK(flydigi_rx_device_info_ex(info_full, sizeof info_full, &dinfo) &&
+          dinfo.model == 130 && dinfo.fw_main == 0x7226 && dinfo.fw_recv == 0x0483 &&
+          dinfo.fw_si == 0x3605 && dinfo.fw_sstar == 0x1043 &&
+          dinfo.chip_main == 5 && dinfo.chip_recv == 4 && dinfo.gyro_type == 1 &&
+          dinfo.features == 0x27 &&
+          (dinfo.features & FD_FEATURE_IMU) && (dinfo.features & FD_FEATURE_TRIGGER_VIBRATE),
+          "全量设备信息：7.2.2.6 主固件 + 能力位 0x27（IMU/LED/Switch/扳机震动）");
+    /* SKU（0x0F）：value + 20B 名称 */
+    uint8_t sku_reply[32] = {0x5a, 0xa5, 0x0f, 0x01, 0x00, 0x01};
+    sku_reply[6] = 'V'; sku_reply[7] = '5'; sku_reply[8] = 'P'; sku_reply[9] = '\0';
+    {
+        uint8_t cs = 1;
+        for (unsigned i = 0; i < 31; i++) cs += sku_reply[i];
+        sku_reply[31] = cs;
+    }
+    uint8_t sku_val = 0;
+    char sku_name[21];
+    CHECK(flydigi_rx_sku(sku_reply, sizeof sku_reply, &sku_val, sku_name) &&
+          sku_val == 1 && strcmp(sku_name, "V5P") == 0,
+          "SKU 名称解析：value=1 名称 V5P");
+    /* 配置指纹（0xA1）：活动槽 + 4×槽 CRC16 LE + 全局 CRC16 */
+    uint8_t fp_reply[32] = {0x5a, 0xa5, 0xa1, 0x01, 0x00, 0x02};
+    fp_reply[6] = 0x11; fp_reply[7] = 0x11; fp_reply[8] = 0x22; fp_reply[9] = 0x22;
+    fp_reply[10] = 0x33; fp_reply[11] = 0x33; fp_reply[12] = 0x44; fp_reply[13] = 0x44;
+    fp_reply[14] = 0x55; fp_reply[15] = 0x55;
+    {
+        uint8_t cs = 1;
+        for (unsigned i = 0; i < 31; i++) cs += fp_reply[i];
+        fp_reply[31] = cs;
+    }
+    uint8_t fp_slot = 0;
+    uint16_t fp_crc[4], fp_gcrc = 0;
+    CHECK(flydigi_rx_fingerprint(fp_reply, sizeof fp_reply, &fp_slot, fp_crc, &fp_gcrc) &&
+          fp_slot == 2 && fp_crc[0] == 0x1111 && fp_crc[3] == 0x4444 && fp_gcrc == 0x5555,
+          "配置指纹：槽 2 / CRC16 序列 / 全局 CRC16");
+    /* RAM 元数据（0xA3 子 1）：status/ramId/槽/长度/CRC32 */
+    uint8_t meta_reply[32] = {0x5a, 0xa5, 0xa3, 0x01, 0x00, 0x05};
+    meta_reply[6] = 0x01;
+    meta_reply[7] = 0x58; meta_reply[8] = 0x02;   /* len 0x258 = 600 */
+    meta_reply[9] = 0x78; meta_reply[10] = 0x56;
+    meta_reply[11] = 0x34; meta_reply[12] = 0x12;  /* crc32 0x12345678 */
+    {
+        uint8_t cs = 1;
+        for (unsigned i = 0; i < 31; i++) cs += meta_reply[i];
+        meta_reply[31] = cs;
+    }
+    uint8_t m_status = 1, m_ram = 0, m_slot = 0;
+    uint16_t m_len = 0;
+    uint32_t m_crc = 0;
+    CHECK(flydigi_rx_ram_meta(meta_reply, sizeof meta_reply, &m_status, &m_ram, &m_slot,
+                              &m_len, &m_crc) &&
+          m_status == 0 && m_ram == 5 && m_slot == 1 && m_len == 600 && m_crc == 0x12345678,
+          "RAM 元数据：ram5 / 600B / CRC32 0x12345678");
     uint8_t hw_reply[32] = {0x5a, 0xa5, 0x03, 0x02, 0x00};
     hw_reply[9] = 15; hw_reply[10] = 2; hw_reply[11] = 3; hw_reply[12] = 4;
     {
@@ -118,15 +179,20 @@ int main(void)
     /* 全局配置 blob（80B，官方 0xA3 读 RAM1 slice(2,82)）字段解码 */
     uint8_t blob80[80] = {0};
     blob80[3] = 15;                        /* 睡眠 15 分钟 */
+    blob80[4] = 1;                         /* 快速切换开 */
     blob80[7] = 'V'; blob80[8] = 'P'; blob80[9] = 'r'; blob80[10] = 0;
+    blob80[39] = 1;                        /* 摇杆自动中心校准开 */
+    blob80[40] = 1;                        /* 板载映射开 */
     blob80[41] = 0xF4; blob80[42] = 0x01;  /* u16LE = 500 → 500Hz */
     blob80[43] = 10;                       /* 摇杆精度 10bit */
     blob80[47] = 1;                        /* 允许第三方接管 */
+    blob80[52] = 1;                        /* XInputHome 开 */
     flydigi_gcfg_t gcfg;
     CHECK(flydigi_gcfg_parse(blob80, &gcfg) && gcfg.report_rate_hz == 500 &&
           gcfg.sleep_minutes == 15 && gcfg.allow_thirdparty && gcfg.js_resolution == 10 &&
+          gcfg.quick_switch && gcfg.js_center_auto && gcfg.local_map && gcfg.xinput_home &&
           strcmp(gcfg.name, "VPr") == 0,
-          "全局配置：500Hz / 睡眠 15 / 接管开 / 10bit / 名称 VPr");
+          "全局配置：500Hz / 睡眠 15 / 接管开 / 10bit / 名称 VPr / 新四字段");
     blob80[41] = 0x00; blob80[42] = 0x00;
     CHECK(flydigi_gcfg_parse(blob80, &gcfg) && gcfg.report_rate_hz == 1000,
           "全局配置：回报率非 500/250/125 → 默认 1000Hz");

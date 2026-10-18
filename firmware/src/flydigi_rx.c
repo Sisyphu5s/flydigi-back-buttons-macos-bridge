@@ -88,6 +88,97 @@ bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
     return true;
 }
 
+/* 应答帧公共校验：魔数由调用方检查，校验和 = 1 + Σ[0..30]（等价于 Σ[2..30]）。 */
+static bool fd_reply_ok(const uint8_t *buf, size_t len)
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
+    uint8_t checksum = 1;
+    for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
+    return checksum == buf[FD_RX_FRAME_BYTES - 1];
+}
+
+static uint16_t rd16be(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+bool flydigi_rx_device_info_ex(const uint8_t *buf, size_t len, flydigi_dev_info_t *out)
+{
+    if (buf == NULL || out == NULL || len < FD_RX_FRAME_BYTES) return false;
+    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x01) return false;
+    if (!fd_reply_ok(buf, len)) return false;
+
+    out->model = buf[5];
+    out->connection = buf[6];
+    out->mac_le = (uint32_t)buf[7] | ((uint32_t)buf[8] << 8) |
+                  ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 24);
+    out->battery_byte = buf[11];
+    out->chip_main = buf[12] & 0x0fu;
+    out->chip_recv = (buf[12] >> 4) & 0x0fu;
+    out->gyro_type = buf[13] & 0x0fu;
+    out->fw_main = rd16be(buf + 15);
+    out->fw_recv = rd16be(buf + 17);
+    out->fw_si = rd16be(buf + 19);
+    out->fw_trigger = rd16be(buf + 21);
+    out->fw_screen = rd16be(buf + 23);
+    out->fw_adc = rd16be(buf + 25);
+    out->fw_sstar = rd16be(buf + 27);
+    out->features = buf[29];
+    return true;
+}
+
+bool flydigi_rx_sku(const uint8_t *buf, size_t len, uint8_t *value, char out[21])
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
+    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x0f) return false;
+    if (!fd_reply_ok(buf, len)) return false;
+
+    if (value != NULL) *value = buf[5];
+    if (out != NULL) {
+        unsigned n = 0;
+        for (; n < 20u && buf[6 + n] != 0; n++) {
+            uint8_t const c = buf[6 + n];
+            out[n] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        out[n] = '\0';
+    }
+    return true;
+}
+
+bool flydigi_rx_fingerprint(const uint8_t *buf, size_t len, uint8_t *active_slot,
+                            uint16_t slot_crc[4], uint16_t *global_crc)
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
+    if (buf[0] != 0x5a || buf[1] != 0xa5 ||
+        (buf[2] != 0xa1 && buf[2] != 0xa2)) return false;
+    if (!fd_reply_ok(buf, len)) return false;
+
+    if (active_slot != NULL) *active_slot = buf[5];
+    if (slot_crc != NULL)
+        for (unsigned i = 0; i < 4u; i++) slot_crc[i] = rd16le(buf + 6 + 2 * i);
+    if (global_crc != NULL) *global_crc = rd16le(buf + 14);
+    return true;
+}
+
+bool flydigi_rx_ram_meta(const uint8_t *buf, size_t len, uint8_t *status, uint8_t *ram_id,
+                         uint8_t *slot, uint16_t *data_len, uint32_t *crc32)
+{
+    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
+    /* 应答布局（payload 自 [3] 起）：[3]=子操作(1) [4]=status [5]=ramId [6]=槽
+     * [7..8]=长度 u16LE [9..12]=CRC32。子操作 0 为 READ_CHUNK，需排除。 */
+    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0xa3 || buf[3] != 0x01) return false;
+    if (!fd_reply_ok(buf, len)) return false;
+
+    if (status != NULL) *status = buf[4];
+    if (ram_id != NULL) *ram_id = buf[5];
+    if (slot != NULL) *slot = buf[6];
+    if (data_len != NULL) *data_len = rd16le(buf + 7);
+    if (crc32 != NULL)
+        *crc32 = (uint32_t)buf[9] | ((uint32_t)buf[10] << 8) |
+                 ((uint32_t)buf[11] << 16) | ((uint32_t)buf[12] << 24);
+    return true;
+}
+
 bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
                           uint8_t *report_rate, uint8_t *precision,
                           uint8_t *sensitivity)
@@ -115,6 +206,10 @@ bool flydigi_gcfg_parse(const uint8_t *blob80, flydigi_gcfg_t *out)
     out->report_rate_hz = (rate == 500u || rate == 250u || rate == 125u) ? rate : 1000u;
     out->sleep_minutes = blob80[3];
     out->allow_thirdparty = blob80[47] == 1u;
+    out->quick_switch = blob80[4] == 1u;
+    out->js_center_auto = blob80[39] == 1u;
+    out->local_map = blob80[40] == 1u;
+    out->xinput_home = blob80[52] == 1u;
     uint8_t const res = blob80[43];
     out->js_resolution = (res >= 8u && res <= 12u) ? res : 12u;
 

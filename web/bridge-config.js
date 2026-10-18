@@ -11,9 +11,12 @@
   const CFG_SIZE = 59, REPORT_SIZE = 63;
   /* 设备端全局配置（0xA3 读 / 0xA0 写）WebHID 命令。 */
   const GCFG_GET = 8, GCFG_SET_SLEEP = 9, GCFG_SET_RATE = 10;
+  /* 2026-10-18 二次核对：官方扩展命令 */
+  const INFO_GET = 11, FIELD_SET = 12, SLOT_SET = 13, CALIB = 14, FP_GET = 15, NAME_SET = 18;
   const GCFG_POLL_MS = 600, GCFG_POLL_MAX = 8;
   const GCFG_SLEEP_OPTIONS = [0, 1, 5, 10, 15, 30, 60];
   const GCFG_RATE_OPTIONS = [1000, 500, 250, 125];
+  const JSRES_OPTIONS = [8, 9, 10, 11, 12];
   const names = ['A','B','D-pad Up','X','Y','D-pad Down','LB','RB','D-pad Left','D-pad Right','Select','Start','L3','R3','M1','M2','M3','M4',null,'Home','C','Z','LM','RM','O'];
   const standardSlots = ['A','B','X','Y','LB','RB','LT','RT','Select','Start','L3','R3','D-pad Up','D-pad Down','D-pad Left','D-pad Right','Home','M1','M2','M3','M4','C','Z','LM','RM','O'];
   const vaderSlots = ['A','B','C','X','Y','Z','LB','RB','LM','RM','Select','Start','L3','R3','M1','M2','M3','M4','O','Home'];
@@ -55,7 +58,10 @@
   function updateCommandButtons() {
     $('connect').disabled = operationBusy;
     for (const id of ['read', 'apply', 'save', 'defaults', 'rumble',
-                      'gcfgRead', 'gcfgSleepApply', 'gcfgRateApply'])
+                      'gcfgRead', 'gcfgSleepApply', 'gcfgRateApply',
+                      'gcfgFp', 'gcfgJsresApply', 'gcfgNameApply',
+                      'slotBtn0', 'slotBtn1', 'slotBtn2', 'slotBtn3',
+                      'calibStart', 'calibFinish'])
       $(id).disabled = !configReady || operationBusy;
     $('rumbleStop').disabled = !device?.opened;
     if (appleProfile && !persistentConfigSupported) {
@@ -219,6 +225,10 @@
       sleep: r[4],
       valid: !!(r[5] & 1),
       allowThirdparty: !!(r[5] & 2),
+      quickSwitch: !!(r[5] & 4),
+      jsCenterAuto: !!(r[5] & 8),
+      localMap: !!(r[5] & 16),
+      xinputHome: !!(r[5] & 32),
       jsResolution: r[6],
       reads: view.getUint32(7, true),
       errors: view.getUint32(11, true),
@@ -231,7 +241,8 @@
   }
   function gcfgA0Label(g) {
     if (!g.a0Replies) return '无记录';
-    const field = g.a0Field === 32 ? '睡眠' : g.a0Field === 33 ? '回报率' : `字段 ${g.a0Field}`;
+    const names = { 1: '名称', 20: '快速切换', 23: '板载映射', 25: '中心自校准', 32: '睡眠', 33: '回报率', 34: '摇杆分辨率', 38: 'XInputHome' };
+    const field = names[g.a0Field] ?? `字段 ${g.a0Field}`;
     return g.a0Status === 0 ? `${field}成功` : `${field}失败 (${g.a0Status})`;
   }
   function refreshGcfgPanel(g) {
@@ -242,10 +253,13 @@
     }
     $('gcfgStatus').textContent =
       `设备端配置: 回报率 ${g.rate ? `${g.rate} Hz` : '未知'} | 睡眠 ${g.sleep ? `${g.sleep} 分钟` : '永不'} | ` +
-      `第三方接管 ${g.allowThirdparty ? '允许' : '禁用'} | 摇杆分辨率 ${g.jsResolution} | ` +
-      `名称 ${g.name || '未知'} | 读取 ${g.reads} 次 / 错误 ${g.errors} 次 | 最近写入：${gcfgA0Label(g)}`;
+      `第三方接管 ${g.allowThirdparty ? '允许' : '禁用'} | 摇杆分辨率 ${g.jsResolution} bit | ` +
+      `快速切换 ${g.quickSwitch ? '开' : '关'} | 中心自校准 ${g.jsCenterAuto ? '开' : '关'} | ` +
+      `板载映射 ${g.localMap ? '开' : '关'} | XInputHome ${g.xinputHome ? '开' : '关'} | ` +
+      `名称 ${g.name || '（空）'} | 读取 ${g.reads} 次 / 错误 ${g.errors} 次 | 最近写入：${gcfgA0Label(g)}`;
     if (GCFG_SLEEP_OPTIONS.includes(g.sleep)) $('gcfgSleep').value = String(g.sleep);
     if (GCFG_RATE_OPTIONS.includes(g.rate)) $('gcfgRate').value = String(g.rate);
+    if (JSRES_OPTIONS.includes(g.jsResolution)) $('gcfgJsres').value = String(g.jsResolution);
   }
   async function readGcfg() {
     return parseGcfgResponse(await command(GCFG_GET));
@@ -275,6 +289,101 @@
     if (r.length < 4 || (r[2] | r[3] << 8) !== hz) throw new Error('回报率写入回显不一致，请重新读取');
     refreshGcfgPanel(await waitGcfgRead(before.reads));
   }
+  /* 通用字段写（白名单 {20,23,25,32,33,34,38}）：jsResolution 等。 */
+  async function applyField(field, value) {
+    const before = await readGcfg();
+    const r = await command(FIELD_SET, [field, value & 0xff, (value >> 8) & 0xff]);
+    if (r[0] !== 0) throw new Error(`字段 ${field} 写入失败 (${r[0]})`);
+    if (r.length < 3 || r[2] !== field) throw new Error('字段写入回显不一致，请重新读取');
+    refreshGcfgPanel(await waitGcfgRead(before.reads));
+  }
+
+  /* ---------- 设备信息 / 指纹 / 校准 / 切槽 / 改名（二次核对新增） ---------- */
+  function parseInfoResponse(r) {
+    if (r.length < 44) throw new Error('设备信息响应长度不足');
+    if (r[0] !== 0) throw new Error(`设备信息读取失败 (${r[0]})`);
+    const view = new DataView(r.buffer, r.byteOffset, r.length);
+    const fw = [];
+    for (let i = 0; i < 7; i++) {
+      const hi = r[8 + 2 * i], lo = r[9 + 2 * i];
+      fw.push(hi || lo ? `${(hi >> 4) & 0xf}.${hi & 0xf}.${(lo >> 4) & 0xf}.${lo & 0xf}` : '-');
+    }
+    const nul = r.indexOf(0, 22);
+    const stop = nul === -1 || nul > 41 ? 42 : nul;
+    let sku = '';
+    for (const byte of r.subarray(22, stop))
+      sku += byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.';
+    const FEATURES = ['IMU', 'LED', 'Switch', '屏幕', '扳机触觉', '扳机震动', '音频', '触觉'];
+    return {
+      model: r[2],
+      connection: r[3],
+      battery: r[4],
+      chipMain: r[5] & 0xf, chipRecv: (r[5] >> 4) & 0xf,
+      gyroType: r[6],
+      features: r[7],
+      featureNames: FEATURES.filter((_, i) => r[7] & (1 << i)),
+      fw,
+      sku: sku.trim(),
+      skuValid: !!r[42],
+      exValid: !!r[43],
+    };
+  }
+  function refreshInfoPanel(info) {
+    const connText = info.connection === 1 ? '无线' : info.connection === 2 ? '有线' : `?${info.connection}`;
+    $('devInfo').textContent =
+      `设备: model ${info.model}（${connText}）| 电量 ${info.battery === 255 ? '未知' : `${info.battery}%`} | ` +
+      `SKU ${info.skuValid ? info.sku : '未知'} | 芯片 ${info.chipMain}/${info.chipRecv} | 陀螺仪 ${info.gyroType} | ` +
+      `固件 主${info.fw[0]} 接收${info.fw[1]} SI${info.fw[2]} 扳机${info.fw[3]} 屏${info.fw[4]} ADC${info.fw[5]} Sstar${info.fw[6]} | ` +
+      `能力 ${info.featureNames.join('/') || '无'}`;
+  }
+  async function readInfo() {
+    const info = parseInfoResponse(await command(INFO_GET));
+    refreshInfoPanel(info);
+    return info;
+  }
+  function parseFingerprint(r) {
+    if (r.length < 18) throw new Error('指纹响应长度不足');
+    const view = new DataView(r.buffer, r.byteOffset, r.length);
+    const crc = [];
+    for (let i = 0; i < 4; i++) crc.push(view.getUint16(4 + 2 * i, true));
+    return {
+      valid: !!r[2], slot: r[3], crc,
+      global: view.getUint16(12, true),
+      pushes: view.getUint32(14, true),
+    };
+  }
+  function refreshFingerprint(fp) {
+    $('fpStatus').textContent = fp.valid
+      ? `配置指纹: 活动槽 ${fp.slot + 1} | 槽 CRC ${fp.crc.map(c => c.toString(16).padStart(4, '0')).join('/')} | ` +
+        `全局 CRC ${fp.global.toString(16).padStart(4, '0')} | 变更推送 ${fp.pushes} 次`
+      : '配置指纹: 未读取（先连接设备）';
+  }
+  async function readFingerprint() {
+    const fp = parseFingerprint(await command(FP_GET));
+    refreshFingerprint(fp);
+    return fp;
+  }
+  async function switchSlot(slot) {
+    const before = await readGcfg();
+    const r = await command(SLOT_SET, [slot]);
+    if (r[0] !== 0) throw new Error(`切槽失败 (${r[0]})`);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await readFingerprint();
+    refreshGcfgPanel(await waitGcfgRead(before.reads));
+  }
+  async function setCalibration(start) {
+    const r = await command(CALIB, [start ? 1 : 0]);
+    if (r[0] !== 0) throw new Error(`校准命令失败 (${r[0]})`);
+  }
+  async function setName(text) {
+    const before = await readGcfg();
+    const bytes = [];
+    for (const ch of text) bytes.push(ch.charCodeAt(0) & 0xff);
+    if (bytes.length > 16) throw new Error('名称最多 16 字节');
+    const r = await command(NAME_SET, bytes);
+    if (r[0] !== 0) throw new Error(`名称写入失败 (${r[0]})`);
+    refreshGcfgPanel(await waitGcfgRead(before.reads));
+  }
 
   async function connect() {
     const filters = DEVICES.map(d => ({...d, usagePage: 0xff00, usage: 1}));
@@ -295,6 +404,8 @@
     lastSaveTelemetry = null;
     saveAwaiting = null;
     $('gcfgStatus').textContent = '设备端配置: -';
+    $('devInfo').textContent = '设备信息: -';
+    $('fpStatus').textContent = '配置指纹: -';
     if (!selected.opened) await selected.open();
     assertCurrent(selected, generation);
     updateCommandButtons();
@@ -443,6 +554,34 @@
     const hz = Number($('gcfgRate').value) || 1000;
     await applyRate(hz);
     setStatus(`回报率已写入：${hz} Hz`);
+  }).catch(showError);
+  $('gcfgFp').onclick = () => runExclusive(async () => {
+    await readFingerprint();
+    await readInfo().catch(() => {});
+    setStatus('已读取配置指纹');
+  }).catch(showError);
+  $('gcfgJsresApply').onclick = () => runExclusive(async () => {
+    const res = Number($('gcfgJsres').value) || 10;
+    await applyField(34, res);
+    setStatus(`摇杆分辨率已写入：${res} bit`);
+  }).catch(showError);
+  $('gcfgNameApply').onclick = () => runExclusive(async () => {
+    const text = $('gcfgName').value || '';
+    await setName(text);
+    setStatus(text ? `名称已写入：${text}` : '名称已清空');
+  }).catch(showError);
+  for (let slot = 0; slot < 4; slot++)
+    $(`slotBtn${slot}`).onclick = () => runExclusive(async () => {
+      await switchSlot(slot);
+      setStatus(`已切换到配置槽 ${slot + 1}`);
+    }).catch(showError);
+  $('calibStart').onclick = () => runExclusive(async () => {
+    await setCalibration(true);
+    setStatus('校准已开始：请把两个摇杆各方向转动 2-3 圈，然后点「结束校准」');
+  }).catch(showError);
+  $('calibFinish').onclick = () => runExclusive(async () => {
+    await setCalibration(false);
+    setStatus('校准已结束');
   }).catch(showError);
   $('sensorConnect').onclick = async () => {
     try {
