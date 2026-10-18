@@ -1,5 +1,5 @@
 // hid_config_probe.swift — exercise the same Feature Report path used by WebHID.
-// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save] [--gcfg] [--set-sleep=N] [--set-rate=N] [--set-field=ID,V] [--fingerprint] [--calibrate=start|finish] [--set-name=TEXT]
+// Usage: swift hid_config_probe.swift [--apple|--scuf|--stadia] [--rumble] [--rumble-timing] [--sensor|--sensor-stale-bias] [--status] [--activity|--activity-triggered] [--wait-seconds=N] [--config-roundtrip] [--reject-invalid] [--save] [--gcfg] [--set-sleep=N] [--set-rate=N] [--set-field=ID,V] [--fingerprint] [--info] [--slot=N] [--calibrate=start|finish] [--set-name=TEXT]
 import Foundation
 import IOKit.hid
 
@@ -31,13 +31,17 @@ let gcfgSetField = CommandLine.arguments
         return (f, v)
     }
 let doFingerprint = CommandLine.arguments.contains("--fingerprint")
+let doInfo = CommandLine.arguments.contains("--info")
+let slotArg = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--slot=") })
+    .flatMap { UInt8($0.dropFirst("--slot=".count)) }
 let calibArg = CommandLine.arguments
     .first(where: { $0.hasPrefix("--calibrate=") })
     .flatMap { $0.dropFirst("--calibrate=".count) }
 let setNameArg = CommandLine.arguments
     .first(where: { $0.hasPrefix("--set-name=") })
     .map { String($0.dropFirst("--set-name=".count)) }
-let doExtras = doFingerprint || calibArg != nil || setNameArg != nil || gcfgSetField != nil
+let doExtras = doFingerprint || doInfo || slotArg != nil || calibArg != nil || setNameArg != nil || gcfgSetField != nil
 let doGcfg = CommandLine.arguments.contains("--gcfg") || gcfgSetSleep != nil || gcfgSetRate != nil
 let appleIdentity = CommandLine.arguments.contains("--apple")
 let scufIdentity = CommandLine.arguments.contains("--scuf")
@@ -224,6 +228,40 @@ func runExtras() -> Bool {
                      r[off], r[off + 1], crcs[0], crcs[1], crcs[2], crcs[3],
                      UInt16(r[off + 10]) | UInt16(r[off + 11]) << 8,
                      Int(r[off + 12]) | Int(r[off + 13]) << 8 | Int(r[off + 14]) << 16 | Int(r[off + 15]) << 24))
+    }
+    if doInfo {
+        /* GET_DEVICE_INFO（命令 0x0B）响应：docs/16 [2]=model [3]=conn [4]=battery
+         * [5]=芯片 [6]=陀螺仪 [7]=能力位 [8..21]=7×fw u16BE [22..41]=SKU 20B
+         * [42]=skuValid [43]=exValid。 */
+        guard let r = command(0x0B) else { return false }
+        let off = (r[0] == 0x11 ? 1 : 0) + 2
+        guard r.count >= off + 42 else { print("extras info: short response"); return false }
+        let fw = (0..<7).map { i -> String in
+            let hi = r[off + 6 + 2 * i], lo = r[off + 7 + 2 * i]
+            return hi == 0 && lo == 0 ? "-" :
+                String(format: "%d.%d.%d.%d", (hi >> 4) & 0xf, hi & 0xf, (lo >> 4) & 0xf, lo & 0xf)
+        }
+        let bits = r[off + 5]
+        let features = ["IMU", "LED", "Switch", "屏幕", "扳机触觉", "扳机震动", "音频", "触觉"]
+            .enumerated().filter { bits & UInt8(1 << $0.offset) != 0 }.map { $0.element }
+        let skuBytes = r[(off + 20)..<(off + 40)].prefix { $0 != 0 }
+        let sku = String(bytes: skuBytes, encoding: .utf8) ?? ""
+        let battery: String = r[off + 2] == 0xff ? "unknown" : "\(r[off + 2])%"
+        print(String(format: "extras info model=%d conn=%d battery=%@ chips=%d/%d gyro=%d features=0x%02x(%@) fw=%@ sku=%@ exValid=%d",
+                     Int(r[off]), Int(r[off + 1]), battery,
+                     Int(r[off + 3] & 0xf), Int((r[off + 3] >> 4) & 0xf), Int(r[off + 4]),
+                     bits, features.joined(separator: "/"), fw.joined(separator: ","), sku,
+                     Int(r[off + 41])))
+        usleep(1_000_000)
+    }
+    if let slot = slotArg {
+        /* SWITCH_SLOT（命令 0x0D）载荷 [1]=槽位 0..3，响应 [2]=槽位回显。 */
+        guard slot < 4 else { print("extras slot: N must be 0..3"); return false }
+        print("extras slot: switch to \(slot)")
+        guard let r = command(0x0D, payload: [slot]) else { return false }
+        let off = r[0] == 0x11 ? 1 : 0
+        print("extras slot status=\(r.count > off ? r[off] : 255) echo=\(r.count > off + 2 ? r[off + 2] : 255)")
+        usleep(1_000_000)
     }
     return true
 }

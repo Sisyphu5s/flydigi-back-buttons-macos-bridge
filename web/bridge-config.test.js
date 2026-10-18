@@ -65,6 +65,67 @@ function fakeDevice() {
   return device;
 }
 
+/* ---------- 真机 golden 夹具（2026-10-18 抓包，Apple 身份 04b4:2412） ----------
+ * 均为 receiveFeatureReport 返回的原始 64B 报告：raw[0]=0x11 报告 ID，
+ * 协议索引 i 对应 raw[i+1]；raw[62..63] 是请求 token 回显（抓包时为当次随机值，
+ * 测试中用 echoToken() 换成当前请求 token 后返回）。
+ * 命令与响应布局见 docs/16 与 firmware/rp2350/main.c 的 bridge_config_set_report。 */
+/* 0x0B GET_DEVICE_INFO 真机抓包：model=130 conn=1 电量100% 芯片5/4 陀螺仪1 能力0x27
+ * fw 7.2.2.6 / 0.4.8.3 / 3.6.0.5 / - / - / - / 1.0.4.3，SKU F5，[42]skuValid=1 [43]exValid=1 */
+const FX_INFO = [
+  0x11, 0x00, 0x01, 0x82, 0x01, 0x64, 0x45, 0x01,
+  0x27, 0x72, 0x26, 0x04, 0x83, 0x36, 0x05, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x43, 0x46,
+  0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x08,
+];
+/* 0x0F GET_FINGERPRINT 真机抓包：valid=1 活动槽=1 CRC=dad9/fcfe/0000/f3ab 全局=e33f 推送=3 */
+const FX_FP = [
+  0x11, 0x00, 0x01, 0x01, 0x01, 0xd9, 0xda, 0xfe,
+  0xfc, 0x00, 0x00, 0xab, 0xf3, 0x3f, 0xe3, 0x03,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xe4,
+];
+/* 0x0C SET_FIELD 真机抓包（field=34 幂等写入）：status=0 [2]=34 字段回显 */
+const FX_SETFIELD_ECHO = [
+  0x11, 0x00, 0x01, 0x22, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf2, 0xe6,
+];
+/* 0x08 GET_GCFG 真机读回：rate=1000 sleep=0 jsres=10 reads=7 name='BRG' a0 最近字段=34 */
+const FX_GCFG = [
+  0x11, 0x00, 0x01, 0xe8, 0x03, 0x00, 0x2f, 0x0a,
+  0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x42, 0x52, 0x47, 0x00, 0xa0, 0x00, 0x20, 0x3f,
+  0xef, 0x00, 0x10, 0x94, 0x18, 0x01, 0x10, 0x84,
+  0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xae, 0xa5,
+];
+
+/* 把夹具中抓包时的 token 换成当前请求的 token 回显。 */
+function echoToken(fx, request) {
+  const bytes = Uint8Array.from(fx);
+  bytes[62] = request[61];
+  bytes[63] = request[62];
+  return new DataView(bytes.buffer);
+}
+for (const [name, fx] of Object.entries({FX_INFO, FX_FP, FX_SETFIELD_ECHO, FX_GCFG}))
+  assert.equal(fx.length, 64, `${name} 应为 64 字节真机抓包`);
+
 /* 构造 GET_GCFG(8) 应答：协议布局见 firmware/rp2350/main.c；
  * receiveFeatureReport 返回的原始报告 [0] 是 0x11 报告 ID，[i+1] 才对应协议索引 i。 */
 function gcfgResponse(g, request) {
@@ -432,63 +493,60 @@ async function testGcfgDisabledState() {
   assert.equal(element('gcfgStatus').textContent, '设备端配置: -');
 }
 
+/* 真机 golden：0x08 GET_GCFG 应答的完整面板渲染（jsres=10 读回，a0 最近写入=34）。 */
+async function testGoldenGcfgCapture() {
+  const {element, hid} = setup();
+  const device = fakeDevice();
+  const receive = device.receiveFeatureReport;
+  device.receiveFeatureReport = async function () {
+    const request = this.sends.at(-1).bytes;
+    if (request[0] === 8) return echoToken(FX_GCFG, request);
+    return receive.call(this);
+  };
+  hid.nextDevice = device;
+  await element('connect').onclick();
+  await element('gcfgRead').onclick();
+  assert.match(element('gcfgStatus').textContent, /回报率 1000 Hz/);
+  assert.match(element('gcfgStatus').textContent, /睡眠 永不/);
+  assert.match(element('gcfgStatus').textContent, /第三方接管 允许/);
+  assert.match(element('gcfgStatus').textContent, /摇杆分辨率 10 bit/);
+  assert.match(element('gcfgStatus').textContent, /快速切换 开/);
+  assert.match(element('gcfgStatus').textContent, /中心自校准 开/);
+  assert.match(element('gcfgStatus').textContent, /板载映射 关/);
+  assert.match(element('gcfgStatus').textContent, /XInputHome 开/);
+  assert.match(element('gcfgStatus').textContent, /名称 BRG/);
+  assert.match(element('gcfgStatus').textContent, /读取 7 次 \/ 错误 0 次/);
+  assert.match(element('gcfgStatus').textContent, /最近写入：摇杆分辨率成功/);
+  assert.equal(element('gcfgSleep').value, '0');
+  assert.equal(element('gcfgRate').value, '1000');
+  assert.equal(element('gcfgJsres').value, '10');
+}
+
 /* ---------- 二次核对新增：设备信息 / 指纹 / 校准 / 切槽 / 分辨率 / 名称 ---------- */
 
-function infoResponse(request) {
-  const bytes = new Uint8Array(64);
-  bytes[0] = 0x11; bytes[2] = 1;
-  bytes[3] = 130;   /* [2] model */
-  bytes[4] = 1;     /* [3] conn */
-  bytes[5] = 100;   /* [4] battery */
-  bytes[6] = 0x45;  /* [5] chips */
-  bytes[7] = 1;     /* [6] gyro */
-  bytes[8] = 0x27;  /* [7] features */
-  [0x7226, 0x0483, 0x3605, 0, 0, 0, 0x1043].forEach((v, i) => {
-    bytes[9 + 2 * i] = v >> 8;         /* [8..21] 7×fw u16BE */
-    bytes[10 + 2 * i] = v & 0xff;
-  });
-  const sku = new TextEncoder().encode('F5');
-  for (let i = 0; i < 20; i++) bytes[23 + i] = sku[i] || 0;   /* [22..41] */
-  bytes[43] = 1;    /* [42] skuValid */
-  bytes[44] = 1;    /* [43] exValid */
-  bytes[62] = request[61]; bytes[63] = request[62];
-  return new DataView(bytes.buffer);
-}
-
-function fpResponse(request) {
-  const bytes = new Uint8Array(64);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = 0x11; bytes[2] = 1;
-  bytes[3] = 1;                                    /* [2] valid */
-  bytes[4] = 1;                                    /* [3] slot */
-  view.setUint16(5, 0xdad9, true);                 /* [4..5] 槽1 CRC16 */
-  view.setUint16(7, 0xcad9, true);                 /* [6..7] 槽2 */
-  view.setUint16(9, 0, true);                      /* [8..9] 槽3 */
-  view.setUint16(11, 0, true);                     /* [10..11] 槽4 */
-  view.setUint16(13, 0xc0c0, true);                /* [12..13] 全局 */
-  view.setUint32(15, 3, true);                     /* [14..17] 推送计数 */
-  bytes[62] = request[61]; bytes[63] = request[62];
-  return new DataView(bytes.buffer);
-}
-
+/* 设备信息（0x0B）/ 指纹（0x0F）面板改用真机 golden 夹具 FX_INFO / FX_FP。 */
 async function testDeviceInfoPanel() {
   const {element, hid} = setup();
   const device = fakeDevice();
   const receive = device.receiveFeatureReport;
   device.receiveFeatureReport = async function () {
     const request = this.sends.at(-1).bytes;
-    if (request[0] === 15) return fpResponse(request);
-    if (request[0] === 11) return infoResponse(request);
+    if (request[0] === 15) return echoToken(FX_FP, request);
+    if (request[0] === 11) return echoToken(FX_INFO, request);
     return receive.call(this);
   };
   hid.nextDevice = device;
   await element('connect').onclick();
   await element('gcfgFp').onclick();
+  assert.match(element('devInfo').textContent, /设备: model 130（无线）\| 电量 100%/);
   assert.match(element('devInfo').textContent, /SKU F5/);
-  assert.match(element('devInfo').textContent, /固件 主7\.2\.2\.6/);
+  assert.match(element('devInfo').textContent, /芯片 5\/4 \| 陀螺仪 1/);
+  assert.match(element('devInfo').textContent,
+    /固件 主7\.2\.2\.6 接收0\.4\.8\.3 SI3\.6\.0\.5 扳机- 屏- ADC- Sstar1\.0\.4\.3/);
   assert.match(element('devInfo').textContent, /能力 IMU\/LED\/Switch\/扳机震动/);
   assert.match(element('fpStatus').textContent, /活动槽 2/);
-  assert.match(element('fpStatus').textContent, /dad9\/cad9\/0000\/0000/);
+  assert.match(element('fpStatus').textContent, /dad9\/fcfe\/0000\/f3ab/);
+  assert.match(element('fpStatus').textContent, /全局 CRC e33f/);
   assert.match(element('fpStatus').textContent, /变更推送 3 次/);
 }
 
@@ -502,11 +560,13 @@ async function testExtrasEncoding() {
   device.receiveFeatureReport = async function () {
     const request = this.sends.at(-1).bytes;
     if (request[0] === 8) { reads++; return gcfgResponse(Object.assign({}, state, {reads}), request); }
-    if (request[0] === 15) return fpResponse(request);
-    if (request[0] === 12 || request[0] === 13 || request[0] === 14 || request[0] === 18) {
+    if (request[0] === 15) return echoToken(FX_FP, request);
+    if (request[0] === 12) return echoToken(FX_SETFIELD_ECHO, request);
+    /* 0x0D/0x0E/0x12 不做 golden 抓包（切槽/校准有状态副作用，改名无必要），
+     * 按 docs/16 布局手工构造：[2]=回显（切槽槽位 / 校准 1|0 / 名称字节数）。 */
+    if (request[0] === 13 || request[0] === 14 || request[0] === 18) {
       const b = new Uint8Array(64); b[0] = 0x11; b[2] = 1;
-      if (request[0] === 12) b[3] = request[1];
-      if (request[0] === 14) b[3] = request[1];
+      if (request[0] === 13 || request[0] === 14) b[3] = request[1];
       if (request[0] === 18) b[3] = 3;
       b[62] = request[61]; b[63] = request[62];
       return new DataView(b.buffer);
@@ -590,9 +650,10 @@ async function testDisconnect() {
   await testGcfgReadDisplay();
   await testGcfgWriteSync();
   await testGcfgDisabledState();
+  await testGoldenGcfgCapture();
   await testDeviceInfoPanel();
   await testExtrasEncoding();
   await testExtrasDisabledState();
   await testDisconnect();
-  console.log('bridge-config: token, legacy, radial flags, rumble, telemetry, gcfg read/write sync, Apple persistence, reconnect PASS');
+  console.log('bridge-config: token, legacy, radial flags, rumble, telemetry, gcfg read/write sync, golden fixtures, Apple persistence, reconnect PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

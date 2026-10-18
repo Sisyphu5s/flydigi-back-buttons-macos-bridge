@@ -7,12 +7,22 @@
     { vendorId: 0x1b1c, productId: 0x3a28 },
     { vendorId: 0x18d1, productId: 0x9400 },
   ];
+  /* ---------- 协议层：命令常量（协议来源 firmware/rp2350/main.c + docs/16） ----------
+   * WebHID：请求走 Feature 报告 0x10（63B），响应读报告 0x11（63B；原始报告含报告
+   * ID 时共 64B，桥在响应 [61..62] 回显请求 token）。解析/构造辅助函数按下列命令分组。 */
   const CMD = 0x10, RESP = 0x11;
   const CFG_SIZE = 59, REPORT_SIZE = 63;
-  /* 设备端全局配置（0xA3 读 / 0xA0 写）WebHID 命令。 */
-  const GCFG_GET = 8, GCFG_SET_SLEEP = 9, GCFG_SET_RATE = 10;
-  /* 2026-10-18 二次核对：官方扩展命令 */
-  const INFO_GET = 11, FIELD_SET = 12, SLOT_SET = 13, CALIB = 14, FP_GET = 15, NAME_SET = 18;
+  /* 设备端全局配置（设备内 0xA3 读 / 0xA0 写）相关命令。 */
+  const GCFG_GET = 8;        /* 0x08 GET_GCFG：返回缓存并排队一次新读取 */
+  const GCFG_SET_SLEEP = 9;  /* 0x09 SET_SLEEP：[1]=分钟（0=永不） */
+  const GCFG_SET_RATE = 10;  /* 0x0A SET_RATE：[1..2]=Hz u16LE */
+  /* 2026-10-18 二次核对：官方扩展命令（响应布局见 docs/16 第 2 节）。 */
+  const INFO_GET = 11;       /* 0x0B GET_DEVICE_INFO */
+  const FIELD_SET = 12;      /* 0x0C SET_FIELD：[1]=字段 [2..3]=值 u16LE，白名单见 applyField */
+  const SLOT_SET = 13;       /* 0x0D SWITCH_SLOT：[1]=槽位 0..3 */
+  const CALIB = 14;          /* 0x0E CALIBRATE：[1]=1 开始 / 0 结束 */
+  const FP_GET = 15;         /* 0x0F GET_FINGERPRINT */
+  const NAME_SET = 18;       /* 0x12 SET_NAME：[1..n]=文本 ≤16B（0x10 与报告 ID 冲突，协议避开） */
   const GCFG_POLL_MS = 600, GCFG_POLL_MAX = 8;
   const GCFG_SLEEP_OPTIONS = [0, 1, 5, 10, 15, 30, 60];
   const GCFG_RATE_OPTIONS = [1000, 500, 250, 125];
@@ -87,6 +97,7 @@
     try { return await result; }
     finally { operationBusy = false; updateCommandButtons(); }
   }
+  /* 0x05 SAVE / 0x04 RESET 响应：[2..5]=保存序号 u32LE（等待 0x12 状态报告的 state/seq 确认落盘）。 */
   function saveSequence(bytes, offset) {
     return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, true);
   }
@@ -176,6 +187,9 @@
     document.querySelectorAll('#mapping select').forEach(s => { cfg[30 + Number(s.dataset.source)] = Number(s.value); });
     cfg[55] = crc32(cfg, 55); cfg[56] = crc32(cfg, 55) >>> 8; cfg[57] = crc32(cfg, 55) >>> 16; cfg[58] = crc32(cfg, 55) >>> 24;
   }
+  /* 协议层公共出口：构造 63B 请求（[0]=命令码 [1..]=载荷 [61..62]=token u16LE），
+   * 发送到 Feature 报告 0x10，等 20ms 读 0x11 响应；raw[0] 为报告 ID 时去掉，
+   * 返回协议索引切片并校验 token 回显。 */
   function command(code, payload = []) {
     const out = new Uint8Array(REPORT_SIZE); out[0] = code; out.set(payload, 1);
     nextToken = (nextToken + 1) & 0xffff || 1;
@@ -207,8 +221,13 @@
     return result;
   }
 
-  /* ---------- 设备端全局配置（GCFG_GET 读缓存并排队新读取） ---------- */
+  /* ---------- 协议层：0x08/0x09/0x0A/0x0C 设备端全局配置（读缓存并排队新读取） ---------- */
 
+  /* 0x08 GET_GCFG 响应（切片后索引）：
+   * [0]=status [1]=版本 [2..3]=rate u16LE [4]=睡眠分钟
+   * [5]=flags（bit0 valid bit1 第三方接管 bit2 快速切换 bit3 中心自校准 bit4 板载映射 bit5 XInputHome）
+   * [6]=摇杆分辨率 [7..10]=读取计数 u32 [11..14]=错误计数 u32 [15..30]=名称 16B
+   * [31]=已排队新读取 [32..35]=0xA0 应答计数 u32 [36]=最近写入状态 [37]=最近写入字段。 */
   function parseGcfgResponse(r) {
     if (r.length < 38) throw new Error('设备配置响应长度不足');
     if (r[0] !== 0) throw new Error(`设备配置读取失败 (${r[0]})`);
@@ -239,6 +258,7 @@
       a0Field: r[37],
     };
   }
+  /* 0x08 响应 [32..37]：最近一次 0xA0 字段写的结果 → 面板中文标签。 */
   function gcfgA0Label(g) {
     if (!g.a0Replies) return '无记录';
     const names = { 1: '名称', 20: '快速切换', 23: '板载映射', 25: '中心自校准', 32: '睡眠', 33: '回报率', 34: '摇杆分辨率', 38: 'XInputHome' };
@@ -275,6 +295,7 @@
     refreshGcfgPanel(last);
     throw new Error('设备配置回读超时，面板显示的可能是旧值');
   }
+  /* 0x09 SET_SLEEP：[1]=分钟（0=永不）；回显 [2]=分钟。 */
   async function applySleep(minutes) {
     const before = await readGcfg();
     const r = await command(GCFG_SET_SLEEP, [minutes]);
@@ -282,6 +303,7 @@
     if (r.length < 3 || r[2] !== minutes) throw new Error('睡眠写入回显不一致，请重新读取');
     refreshGcfgPanel(await waitGcfgRead(before.reads));
   }
+  /* 0x0A SET_RATE：[1..2]=Hz u16LE；回显 [2..3]=Hz u16LE。 */
   async function applyRate(hz) {
     const before = await readGcfg();
     const r = await command(GCFG_SET_RATE, [hz & 0xff, (hz >> 8) & 0xff]);
@@ -289,7 +311,8 @@
     if (r.length < 4 || (r[2] | r[3] << 8) !== hz) throw new Error('回报率写入回显不一致，请重新读取');
     refreshGcfgPanel(await waitGcfgRead(before.reads));
   }
-  /* 通用字段写（白名单 {20,23,25,32,33,34,38}）：jsResolution 等。 */
+  /* 0x0C SET_FIELD：[1]=字段 [2..3]=值 u16LE；回显 [2]=字段。
+   * 白名单 {20,23,25,32,33,34,38}：jsResolution(34) 等。 */
   async function applyField(field, value) {
     const before = await readGcfg();
     const r = await command(FIELD_SET, [field, value & 0xff, (value >> 8) & 0xff]);
@@ -298,7 +321,12 @@
     refreshGcfgPanel(await waitGcfgRead(before.reads));
   }
 
-  /* ---------- 设备信息 / 指纹 / 校准 / 切槽 / 改名（二次核对新增） ---------- */
+  /* ---------- 协议层：0x0B/0x0D/0x0E/0x0F/0x12 设备信息 / 指纹 / 切槽 / 校准 / 改名 ---------- */
+
+  /* 0x0B GET_DEVICE_INFO 响应：
+   * [2]=model [3]=conn（1 无线 / 2 有线） [4]=电量（0xff 未知） [5]=芯片 lo=主 hi=接收
+   * [6]=陀螺仪类型 [7]=能力位 [8..21]=7×fw u16BE（各 4 nibble：a.b.c.d）
+   * [22..41]=SKU 20B [42]=skuValid [43]=exValid。 */
   function parseInfoResponse(r) {
     if (r.length < 44) throw new Error('设备信息响应长度不足');
     if (r[0] !== 0) throw new Error(`设备信息读取失败 (${r[0]})`);
@@ -341,6 +369,8 @@
     refreshInfoPanel(info);
     return info;
   }
+  /* 0x0F GET_FINGERPRINT 响应：
+   * [2]=valid [3]=活动槽 [4..11]=槽 CRC16×4 LE [12..13]=全局 CRC16 [14..17]=推送计数 u32。 */
   function parseFingerprint(r) {
     if (r.length < 18) throw new Error('指纹响应长度不足');
     const view = new DataView(r.buffer, r.byteOffset, r.length);
@@ -363,6 +393,7 @@
     refreshFingerprint(fp);
     return fp;
   }
+  /* 0x0D SWITCH_SLOT：[1]=槽位 0..3；回显 [2]=槽位。切换后刷新指纹与 GCFG 面板。 */
   async function switchSlot(slot) {
     const before = await readGcfg();
     const r = await command(SLOT_SET, [slot]);
@@ -371,10 +402,12 @@
     await readFingerprint();
     refreshGcfgPanel(await waitGcfgRead(before.reads));
   }
+  /* 0x0E CALIBRATE：[1]=1 开始 / 0 结束；回显 [2]。 */
   async function setCalibration(start) {
     const r = await command(CALIB, [start ? 1 : 0]);
     if (r[0] !== 0) throw new Error(`校准命令失败 (${r[0]})`);
   }
+  /* 0x12 SET_NAME：[1..n]=UTF-8 名称 ≤16B；回显 [2]=字节数。 */
   async function setName(text) {
     const before = await readGcfg();
     const bytes = [];
@@ -468,6 +501,8 @@
     setStatus(`已连接 ${selected.productName || 'Flydigi Bridge'}`);
     await readConfig();
   }
+  /* 0x01 GET_INFO：legacy 信息（[4] 是否有电量 [5] 电量% [12] 输出按钮数 [13] token 支持
+   * [14] Apple profile [15] 能力位）；0x02 GET_CONFIG：[2..60]=59B 配置体。 */
   async function readConfig() {
     const info = await command(1);
     const level = info[4] && info[5] !== 255 ? `${info[5]}%` : '未知';
@@ -488,6 +523,7 @@
     setStatus(`已读取配置 | 电量 ${level} | 输出按钮 ${outputSlots}` +
       (appleProfile && !persistentConfigSupported ? ' | 实验身份，Flash 保存已禁用' : ''));
   }
+  /* 0x03 SET_CONFIG：载荷为 59B 配置体；[0]=status。 */
   async function apply() {
     saveForm();
     const r = await command(3, cfg);
