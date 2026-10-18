@@ -213,6 +213,28 @@ static void cfg_response_status(uint8_t status)
     s_cfg_response[1] = BRIDGE_CONFIG_VERSION;
 }
 
+/* 分发表处理函数用的响应写入辅助（off = s_cfg_response 内偏移，减少手写索引）。 */
+static void resp_u8(uint16_t off, uint8_t v)
+{
+    s_cfg_response[off] = v;
+}
+
+static void resp_u16le(uint16_t off, uint16_t v)
+{
+    s_cfg_response[off] = (uint8_t)(v & 0xffu);
+    s_cfg_response[off + 1] = (uint8_t)(v >> 8);
+}
+
+static void resp_u32le(uint16_t off, uint32_t v)
+{
+    for (unsigned i = 0; i < 4; i++) s_cfg_response[off + i] = (uint8_t)(v >> (8 * i));
+}
+
+static void resp_bytes(uint16_t off, const void *p, unsigned n)
+{
+    memcpy(&s_cfg_response[off], p, n);
+}
+
 #if defined(APPLE_PERSISTENT_CONFIG) || (!defined(GENERIC_APPLE_IDENTITY) && !defined(CORSAIR_APPLE_IDENTITY) && !defined(GENERIC_PID_PROBE) && !defined(CHROMIUM_STADIA_PROBE))
 static void cfg_response_save_queued(void)
 {
@@ -265,168 +287,269 @@ uint16_t bridge_config_get_report(uint8_t report_id, uint8_t *buffer, uint16_t r
     return n;
 }
 
+/* ---- WebHID 配置命令处理函数（每命令一个；逻辑逐字迁移） ---- */
+
+static void cfg_get_info(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+    cfg_response_info();
+}
+
+static void cfg_get_config(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+    bridge_config_t cfg;
+    bridge_config_get(&cfg);
+    cfg_response_status(0);
+    memcpy(&s_cfg_response[2], &cfg,
+           sizeof cfg < sizeof s_cfg_response - 2 ? sizeof cfg : sizeof s_cfg_response - 2);
+}
+
+static void cfg_set_config(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    bridge_config_t cfg;
+    memcpy(&cfg, &buf[1], sizeof cfg);
+    if (bridge_config_set(&cfg)) cfg_response_status(0);
+    else cfg_response_status(1);
+}
+
+static void cfg_reset(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+#if (defined(GENERIC_APPLE_IDENTITY) && !defined(APPLE_PERSISTENT_CONFIG)) || defined(CORSAIR_APPLE_IDENTITY) || defined(GENERIC_PID_PROBE) || defined(CHROMIUM_STADIA_PROBE)
+    cfg_response_status(2); /* do not overwrite the normal Generic map */
+#else
+    bridge_config_t cfg;
+    bridge_config_defaults(&cfg);
+    bridge_config_set(&cfg);
+    cfg_response_save_queued();
+#endif
+}
+
+static void cfg_save(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+#if (defined(GENERIC_APPLE_IDENTITY) && !defined(APPLE_PERSISTENT_CONFIG)) || defined(CORSAIR_APPLE_IDENTITY) || defined(GENERIC_PID_PROBE) || defined(CHROMIUM_STADIA_PROBE)
+    cfg_response_status(2);
+#else
+    cfg_response_save_queued();
+#endif
+}
+
+static void cfg_set_gyro_bias(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    bridge_config_t cfg;
+    bridge_config_get(&cfg);
+    memcpy(cfg.gyro_bias, &buf[1], sizeof cfg.gyro_bias);
+    bridge_config_finalize(&cfg);
+    bridge_config_set(&cfg);
+    cfg_response_status(0);
+}
+
+static void cfg_test_rumble(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    flydigi_host_rumble(buf[1], buf[2]);
+    cfg_response_status(0);
+}
+
+static void cfg_get_gcfg(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+    fd_host_status_t st;
+    flydigi_host_get(NULL, &st, NULL);
+    flydigi_host_request_global_config();      /* 每次调用都排队一次新读取 */
+    cfg_response_status(0);
+    /* 布局：[2..3]=rate u16LE [4]=sleep [5]=flags(bit0 valid, bit1 3rd-party,
+     * bit2 快速切换, bit3 摇杆自动中心校准, bit4 板载映射, bit5 XInputHome)
+     * [6]=jsres [7..10]=reads u32 [11..14]=errors u32 [15..30]=name(16B)
+     * [31]=requested [32..35]=a0_replies u32 [36]=a0_status [37]=a0_field */
+    resp_u16le(2, st.gcfg.report_rate_hz);
+    resp_u8(4, st.gcfg.sleep_minutes);
+    resp_u8(5, (uint8_t)((st.gcfg_valid ? 1u : 0u) |
+                         (st.gcfg.allow_thirdparty ? 2u : 0u) |
+                         (st.gcfg.quick_switch ? 4u : 0u) |
+                         (st.gcfg.js_center_auto ? 8u : 0u) |
+                         (st.gcfg.local_map ? 16u : 0u) |
+                         (st.gcfg.xinput_home ? 32u : 0u)));
+    resp_u8(6, st.gcfg.js_resolution);
+    resp_u32le(7, st.gcfg_reads);
+    resp_u32le(11, st.gcfg_errors);
+    resp_bytes(15, st.gcfg.name, 16);
+    resp_u8(31, 1);
+    resp_u32le(32, st.a0_replies);
+    resp_u8(36, st.a0_last_status);
+    resp_u8(37, st.a0_last_field);
+}
+
+static void cfg_set_sleep(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    flydigi_host_request_sleep_minutes(buf[1]);
+    cfg_response_status(0);
+    resp_u8(2, buf[1]);
+}
+
+static void cfg_set_rate(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    flydigi_host_request_report_rate_hz((uint16_t)(buf[1] | ((uint16_t)buf[2] << 8)));
+    cfg_response_status(0);
+    resp_u8(2, buf[1]);
+    resp_u8(3, buf[2]);
+}
+
+static void cfg_get_device_info(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+    fd_host_status_t st;
+    flydigi_host_get(NULL, &st, NULL);
+    flydigi_host_request_sku();                /* 顺带刷新 SKU */
+    cfg_response_status(0);
+    /* 布局：[2]=model [3]=conn [4]=battery [5]=chips(lo=main hi=recv)
+     * [6]=gyro_type [7]=features [8..21]=7×fw u16BE
+     * [22..41]=SKU 20B [42]=sku.valid [43]=dev_ext.valid */
+    const flydigi_dev_info_t *d = &st.dev_ext.ex;
+    resp_u8(2, st.dev_model);
+    resp_u8(3, st.dev_connection);
+    resp_u8(4, st.battery_valid ? st.battery_percent : 0xffu);
+    resp_u8(5, (uint8_t)(d->chip_main | (d->chip_recv << 4)));
+    resp_u8(6, d->gyro_type);
+    resp_u8(7, d->features);
+    resp_u8(8, (uint8_t)(d->fw_main >> 8));
+    resp_u8(9, (uint8_t)d->fw_main);
+    resp_u8(10, (uint8_t)(d->fw_recv >> 8));
+    resp_u8(11, (uint8_t)d->fw_recv);
+    resp_u8(12, (uint8_t)(d->fw_si >> 8));
+    resp_u8(13, (uint8_t)d->fw_si);
+    resp_u8(14, (uint8_t)(d->fw_trigger >> 8));
+    resp_u8(15, (uint8_t)d->fw_trigger);
+    resp_u8(16, (uint8_t)(d->fw_screen >> 8));
+    resp_u8(17, (uint8_t)d->fw_screen);
+    resp_u8(18, (uint8_t)(d->fw_adc >> 8));
+    resp_u8(19, (uint8_t)d->fw_adc);
+    resp_u8(20, (uint8_t)(d->fw_sstar >> 8));
+    resp_u8(21, (uint8_t)d->fw_sstar);
+    if (st.sku.valid) resp_bytes(22, st.sku.name, 20);
+    resp_u8(42, st.sku.valid ? 1u : 0u);
+    resp_u8(43, st.dev_ext.valid ? 1u : 0u);
+}
+
+static void cfg_set_field(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    uint8_t const field = buf[1];
+    uint16_t const value = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
+    if (flydigi_host_field_writable(field)) {
+        flydigi_host_request_field(field, value);
+        cfg_response_status(0);
+        resp_u8(2, field);
+    } else {
+        cfg_response_status(3);   /* 字段不在白名单（37/1 走专用入口） */
+        resp_u8(2, field);
+    }
+}
+
+static void cfg_switch_slot(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    flydigi_host_request_switch_slot(buf[1]);
+    cfg_response_status(0);
+    resp_u8(2, (uint8_t)(buf[1] & 0x03u));
+}
+
+static void cfg_calibrate(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    flydigi_host_request_calibration(buf[1] != 0);
+    cfg_response_status(0);
+    resp_u8(2, buf[1] ? 1u : 0u);
+}
+
+static void cfg_get_fingerprint(const uint8_t *buf, uint16_t len)
+{
+    (void)buf;
+    (void)len;
+    fd_host_status_t st;
+    flydigi_host_get(NULL, &st, NULL);
+    flydigi_host_request_fingerprint();        /* 触发新查询 */
+    cfg_response_status(0);
+    /* 布局：[2]=valid [3]=active_slot [4..11]=槽 CRC16×4 LE
+     * [12..13]=全局 CRC16 LE [14..17]=push 计数 u32 */
+    resp_u8(2, st.fp.valid ? 1u : 0u);
+    resp_u8(3, st.fp.active_slot);
+    for (unsigned i = 0; i < 4u; i++)
+        resp_u16le((uint16_t)(4u + 2u * i), st.fp.slot_crc[i]);
+    resp_u16le(12, st.fp.global_crc);
+    resp_u32le(14, st.fp.push_count);
+}
+
+static void cfg_set_name(const uint8_t *buf, uint16_t len)
+{
+    (void)len;
+    char text[17];
+    unsigned n = 0;
+    for (; n < 16u && (1u + n) < len && buf[1 + n] != 0; n++)
+        text[n] = (char)buf[1 + n];
+    text[n] = '\0';
+    flydigi_host_request_name(text);
+    cfg_response_status(0);
+    resp_u8(2, (uint8_t)n);
+}
+
+/* 命令分发表：min_len 即原 `bufsize >= N` 条件；命中但长度不足与未知命令同走 status=2。 */
+typedef struct {
+    uint8_t cmd;
+    uint16_t min_len;
+    void (*fn)(const uint8_t *buf, uint16_t len);
+} cfg_cmd_t;
+
+static const cfg_cmd_t s_cfg_cmds[] = {
+    { CFG_CMD_GET_INFO,        0, cfg_get_info },
+    { CFG_CMD_GET_CONFIG,      0, cfg_get_config },
+    { CFG_CMD_SET_CONFIG,      (uint16_t)(1u + sizeof(bridge_config_t)), cfg_set_config },
+    { CFG_CMD_RESET,           0, cfg_reset },
+    { CFG_CMD_SAVE,            0, cfg_save },
+    { CFG_CMD_SET_GYRO_BIAS,   7, cfg_set_gyro_bias },
+    { CFG_CMD_TEST_RUMBLE,     3, cfg_test_rumble },
+    { CFG_CMD_GET_GCFG,        0, cfg_get_gcfg },
+    { CFG_CMD_SET_SLEEP,       2, cfg_set_sleep },
+    { CFG_CMD_SET_RATE,        3, cfg_set_rate },
+    { CFG_CMD_GET_DEVICE_INFO, 0, cfg_get_device_info },
+    { CFG_CMD_SET_FIELD,       3, cfg_set_field },
+    { CFG_CMD_SWITCH_SLOT,     2, cfg_switch_slot },
+    { CFG_CMD_CALIBRATE,       2, cfg_calibrate },
+    { CFG_CMD_GET_FINGERPRINT, 0, cfg_get_fingerprint },
+    { CFG_CMD_SET_NAME,        2, cfg_set_name },
+};
+
 void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
                               const uint8_t *buffer, uint16_t bufsize)
 {
     if (report_id != BRIDGE_CONFIG_CMD_REPORT_ID || buffer == NULL || bufsize == 0 ||
         report_type != HID_REPORT_TYPE_FEATURE)
         return;
-    const uint8_t cmd = buffer[0];
-    if (cmd == CFG_CMD_GET_INFO) {
-        cfg_response_info();
-    } else if (cmd == CFG_CMD_GET_CONFIG) {
-        bridge_config_t cfg;
-        bridge_config_get(&cfg);
-        cfg_response_status(0);
-        memcpy(&s_cfg_response[2], &cfg,
-               sizeof cfg < sizeof s_cfg_response - 2 ? sizeof cfg : sizeof s_cfg_response - 2);
-    } else if (cmd == CFG_CMD_SET_CONFIG && bufsize >= 1u + sizeof(bridge_config_t)) {
-        bridge_config_t cfg;
-        memcpy(&cfg, &buffer[1], sizeof cfg);
-        if (bridge_config_set(&cfg)) cfg_response_status(0);
-        else cfg_response_status(1);
-    } else if (cmd == CFG_CMD_RESET) {
-#if (defined(GENERIC_APPLE_IDENTITY) && !defined(APPLE_PERSISTENT_CONFIG)) || defined(CORSAIR_APPLE_IDENTITY) || defined(GENERIC_PID_PROBE) || defined(CHROMIUM_STADIA_PROBE)
-        cfg_response_status(2); /* do not overwrite the normal Generic map */
-#else
-        bridge_config_t cfg;
-        bridge_config_defaults(&cfg);
-        bridge_config_set(&cfg);
-        cfg_response_save_queued();
-#endif
-    } else if (cmd == CFG_CMD_SAVE) {
-#if (defined(GENERIC_APPLE_IDENTITY) && !defined(APPLE_PERSISTENT_CONFIG)) || defined(CORSAIR_APPLE_IDENTITY) || defined(GENERIC_PID_PROBE) || defined(CHROMIUM_STADIA_PROBE)
-        cfg_response_status(2);
-#else
-        cfg_response_save_queued();
-#endif
-    } else if (cmd == CFG_CMD_SET_GYRO_BIAS && bufsize >= 7u) {
-        bridge_config_t cfg;
-        bridge_config_get(&cfg);
-        memcpy(cfg.gyro_bias, &buffer[1], sizeof cfg.gyro_bias);
-        bridge_config_finalize(&cfg);
-        bridge_config_set(&cfg);
-        cfg_response_status(0);
-    } else if (cmd == CFG_CMD_TEST_RUMBLE && bufsize >= 3u) {
-        flydigi_host_rumble(buffer[1], buffer[2]);
-        cfg_response_status(0);
-    } else if (cmd == CFG_CMD_GET_GCFG) {
-        fd_host_status_t st;
-        flydigi_host_get(NULL, &st, NULL);
-        flydigi_host_request_global_config();      /* 每次调用都排队一次新读取 */
-        cfg_response_status(0);
-        /* 布局：[2..3]=rate u16LE [4]=sleep [5]=flags(bit0 valid, bit1 3rd-party,
-         * bit2 快速切换, bit3 摇杆自动中心校准, bit4 板载映射, bit5 XInputHome)
-         * [6]=jsres [7..10]=reads u32 [11..14]=errors u32 [15..30]=name(16B)
-         * [31]=requested [32..35]=a0_replies u32 [36]=a0_status [37]=a0_field */
-        s_cfg_response[2] = (uint8_t)(st.gcfg.report_rate_hz & 0xffu);
-        s_cfg_response[3] = (uint8_t)(st.gcfg.report_rate_hz >> 8);
-        s_cfg_response[4] = st.gcfg.sleep_minutes;
-        s_cfg_response[5] = (uint8_t)((st.gcfg_valid ? 1u : 0u) |
-                                      (st.gcfg.allow_thirdparty ? 2u : 0u) |
-                                      (st.gcfg.quick_switch ? 4u : 0u) |
-                                      (st.gcfg.js_center_auto ? 8u : 0u) |
-                                      (st.gcfg.local_map ? 16u : 0u) |
-                                      (st.gcfg.xinput_home ? 32u : 0u));
-        s_cfg_response[6] = st.gcfg.js_resolution;
-        for (unsigned i = 0; i < 4; i++) {
-            s_cfg_response[7 + i] = (uint8_t)(st.gcfg_reads >> (8 * i));
-            s_cfg_response[11 + i] = (uint8_t)(st.gcfg_errors >> (8 * i));
-            s_cfg_response[32 + i] = (uint8_t)(st.a0_replies >> (8 * i));
+    uint8_t const cmd = buffer[0];
+    const cfg_cmd_t *handler = NULL;
+    for (unsigned i = 0; i < sizeof s_cfg_cmds / sizeof s_cfg_cmds[0]; i++) {
+        if (s_cfg_cmds[i].cmd == cmd && bufsize >= s_cfg_cmds[i].min_len) {
+            handler = &s_cfg_cmds[i];
+            break;
         }
-        memcpy(&s_cfg_response[15], st.gcfg.name, 16);
-        s_cfg_response[31] = 1;
-        s_cfg_response[36] = st.a0_last_status;
-        s_cfg_response[37] = st.a0_last_field;
-    } else if (cmd == CFG_CMD_SET_SLEEP && bufsize >= 2u) {
-        flydigi_host_request_sleep_minutes(buffer[1]);
-        cfg_response_status(0);
-        s_cfg_response[2] = buffer[1];
-    } else if (cmd == CFG_CMD_SET_RATE && bufsize >= 3u) {
-        flydigi_host_request_report_rate_hz((uint16_t)(buffer[1] | ((uint16_t)buffer[2] << 8)));
-        cfg_response_status(0);
-        s_cfg_response[2] = buffer[1];
-        s_cfg_response[3] = buffer[2];
-    } else if (cmd == CFG_CMD_GET_DEVICE_INFO) {
-        fd_host_status_t st;
-        flydigi_host_get(NULL, &st, NULL);
-        flydigi_host_request_sku();                /* 顺带刷新 SKU */
-        cfg_response_status(0);
-        /* 布局：[2]=model [3]=conn [4]=battery [5]=chips(lo=main hi=recv)
-         * [6]=gyro_type [7]=features [8..21]=7×fw u16BE
-         * [22..41]=SKU 20B [42]=sku.valid [43]=dev_ext.valid */
-        const flydigi_dev_info_t *d = &st.dev_ext.ex;
-        s_cfg_response[2] = st.dev_model;
-        s_cfg_response[3] = st.dev_connection;
-        s_cfg_response[4] = st.battery_valid ? st.battery_percent : 0xffu;
-        s_cfg_response[5] = (uint8_t)(d->chip_main | (d->chip_recv << 4));
-        s_cfg_response[6] = d->gyro_type;
-        s_cfg_response[7] = d->features;
-        s_cfg_response[8] = (uint8_t)(d->fw_main >> 8);
-        s_cfg_response[9] = (uint8_t)d->fw_main;
-        s_cfg_response[10] = (uint8_t)(d->fw_recv >> 8);
-        s_cfg_response[11] = (uint8_t)d->fw_recv;
-        s_cfg_response[12] = (uint8_t)(d->fw_si >> 8);
-        s_cfg_response[13] = (uint8_t)d->fw_si;
-        s_cfg_response[14] = (uint8_t)(d->fw_trigger >> 8);
-        s_cfg_response[15] = (uint8_t)d->fw_trigger;
-        s_cfg_response[16] = (uint8_t)(d->fw_screen >> 8);
-        s_cfg_response[17] = (uint8_t)d->fw_screen;
-        s_cfg_response[18] = (uint8_t)(d->fw_adc >> 8);
-        s_cfg_response[19] = (uint8_t)d->fw_adc;
-        s_cfg_response[20] = (uint8_t)(d->fw_sstar >> 8);
-        s_cfg_response[21] = (uint8_t)d->fw_sstar;
-        if (st.sku.valid) memcpy(&s_cfg_response[22], st.sku.name, 20);
-        s_cfg_response[42] = st.sku.valid ? 1u : 0u;
-        s_cfg_response[43] = st.dev_ext.valid ? 1u : 0u;
-    } else if (cmd == CFG_CMD_SET_FIELD && bufsize >= 3u) {
-        uint8_t const field = buffer[1];
-        uint16_t const value = (uint16_t)(buffer[2] | ((uint16_t)buffer[3] << 8));
-        if (flydigi_host_field_writable(field)) {
-            flydigi_host_request_field(field, value);
-            cfg_response_status(0);
-            s_cfg_response[2] = field;
-        } else {
-            cfg_response_status(3);   /* 字段不在白名单（37/1 走专用入口） */
-            s_cfg_response[2] = field;
-        }
-    } else if (cmd == CFG_CMD_SWITCH_SLOT && bufsize >= 2u) {
-        flydigi_host_request_switch_slot(buffer[1]);
-        cfg_response_status(0);
-        s_cfg_response[2] = (uint8_t)(buffer[1] & 0x03u);
-    } else if (cmd == CFG_CMD_CALIBRATE && bufsize >= 2u) {
-        flydigi_host_request_calibration(buffer[1] != 0);
-        cfg_response_status(0);
-        s_cfg_response[2] = buffer[1] ? 1u : 0u;
-    } else if (cmd == CFG_CMD_GET_FINGERPRINT) {
-        fd_host_status_t st;
-        flydigi_host_get(NULL, &st, NULL);
-        flydigi_host_request_fingerprint();        /* 触发新查询 */
-        cfg_response_status(0);
-        /* 布局：[2]=valid [3]=active_slot [4..11]=槽 CRC16×4 LE
-         * [12..13]=全局 CRC16 LE [14..17]=push 计数 u32 */
-        s_cfg_response[2] = st.fp.valid ? 1u : 0u;
-        s_cfg_response[3] = st.fp.active_slot;
-        for (unsigned i = 0; i < 4u; i++) {
-            s_cfg_response[4 + 2 * i] = (uint8_t)(st.fp.slot_crc[i] & 0xffu);
-            s_cfg_response[5 + 2 * i] = (uint8_t)(st.fp.slot_crc[i] >> 8);
-        }
-        s_cfg_response[12] = (uint8_t)(st.fp.global_crc & 0xffu);
-        s_cfg_response[13] = (uint8_t)(st.fp.global_crc >> 8);
-        for (unsigned i = 0; i < 4u; i++)
-            s_cfg_response[14 + i] = (uint8_t)(st.fp.push_count >> (8 * i));
-    } else if (cmd == CFG_CMD_SET_NAME && bufsize >= 2u) {
-        char text[17];
-        unsigned n = 0;
-        for (; n < 16u && (1u + n) < bufsize && buffer[1 + n] != 0; n++)
-            text[n] = (char)buffer[1 + n];
-        text[n] = '\0';
-        flydigi_host_request_name(text);
-        cfg_response_status(0);
-        s_cfg_response[2] = (uint8_t)n;
+    }
+    if (handler != NULL) {
+        handler->fn(buffer, bufsize);
     } else {
         cfg_response_status(2);
-        /* 诊断：回显桥实际看到的命令字与报告长度（排查未知命令）。 */
+        /* 诊断：回显桥实际看到的命令字与报告长度（未知命令；命中但长度不足同此）。 */
         s_cfg_response[2] = cmd;
         s_cfg_response[3] = (uint8_t)(bufsize > 255u ? 255u : bufsize);
     }
@@ -655,6 +778,53 @@ static void usb_force_reset_bus(void)
 }
 
 /* ===================== 状态行 ===================== */
+/* 三行摘录（xr / FP / GLTCH）由精简心跳与全量状态共用，格式串只写一份防漂移。 */
+static void log_line_brg_xr(const fd_host_status_t *st)
+{
+    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu usb=%lu/s usb_dt=%lu..%lu late=%lu\n",
+         (unsigned long)st->xinput_reports, (unsigned long)st->xinput_invalid_buttons,
+         (unsigned long)st->ext_reports,
+         (unsigned long)st->ext_frames, (unsigned long)st->ext_bad_checksum,
+         (unsigned long)st->cmds_sent,
+            st->ext_us_stale != 0 && st->ext_us_stale < FD_EXT_FRESH_US ? "yes" : "no",
+            (unsigned long)st->ext_us_stale, (unsigned long)s_reports_sent,
+            (unsigned long)s_usb_rate,
+            (unsigned long)s_usb_dt_min_us, (unsigned long)s_usb_dt_max_us,
+            (unsigned long)s_usb_refill_late);
+}
+
+static void log_line_fp(const fd_host_status_t *st)
+{
+    brg_log("[FP] slot=%u crc=%04x/%04x/%04x/%04x g=%04x pushes=%lu meta=%02x r%u len=%u crc32=%08lx sw=%lu sv=%lu rs=%lu cal=%lu/%lu/%lu q=%u/%lu\n",
+            st->fp.active_slot, st->fp.slot_crc[0], st->fp.slot_crc[1],
+            st->fp.slot_crc[2], st->fp.slot_crc[3], st->fp.global_crc,
+            (unsigned long)st->fp.push_count, st->meta.status, st->meta.ram,
+            st->meta.len, (unsigned long)st->meta.crc32,
+            (unsigned long)st->fp.switches, (unsigned long)st->ops.save_replies,
+            (unsigned long)st->ops.reset_replies, (unsigned long)st->ops.calib_starts,
+            (unsigned long)st->ops.calib_finishes, (unsigned long)st->ops.calib_replies,
+            (unsigned)flydigi_host_cmdq_depth(), (unsigned long)st->q_drops);
+}
+
+static void log_line_gltch(const fd_host_status_t *st)
+{
+    brg_log("[GLTCH] zero_imu=%lu splice=%lu sp=%02x%02x%02x%02x\n",
+            (unsigned long)st->glitch.zero_imu, (unsigned long)st->glitch.splice,
+            st->glitch.last_splice_raw[13], st->glitch.last_splice_raw[14],
+            st->glitch.last_splice_raw[15], st->glitch.last_splice_raw[16]);
+}
+
+/* 精简状态（2 秒心跳 + 首次 banner 后）：xr / FP / GLTCH 三行。 */
+static void log_status_brief(void)
+{
+    fd_host_status_t st;
+    flydigi_host_get(NULL, &st, NULL);
+    log_line_brg_xr(&st);
+    log_line_fp(&st);
+    log_line_gltch(&st);
+}
+
+/* 全量状态（控制台 'i'）：逐字节内容与拆分前一致。 */
 static void log_status(void)
 {
     fd_host_status_t st;
@@ -669,16 +839,7 @@ static void log_status(void)
          st.xitf_num, st.ext_itf_num,
          st.xep_in, st.xep_in_size, st.ext_ep_in, st.ext_ep_in_size,
          st.ext_ep_out, st.ext_ep_out_size);
-    brg_log("[BRG] xr=%lu xi_bad=%lu er=%lu ef=%lu ef_bad=%lu cmd=%lu fresh(ext)=%s stale_us=%lu sent=%lu usb=%lu/s usb_dt=%lu..%lu late=%lu\n",
-         (unsigned long)st.xinput_reports, (unsigned long)st.xinput_invalid_buttons,
-         (unsigned long)st.ext_reports,
-         (unsigned long)st.ext_frames, (unsigned long)st.ext_bad_checksum,
-         (unsigned long)st.cmds_sent,
-            st.ext_us_stale != 0 && st.ext_us_stale < FD_EXT_FRESH_US ? "yes" : "no",
-            (unsigned long)st.ext_us_stale, (unsigned long)s_reports_sent,
-            (unsigned long)s_usb_rate,
-            (unsigned long)s_usb_dt_min_us, (unsigned long)s_usb_dt_max_us,
-            (unsigned long)s_usb_refill_late);
+    log_line_brg_xr(&st);
     /* 设备信息（cmd 01）：型号/连接/主固件版本 */
     brg_log("[DEV] model=%u conn=%u fw=%u.%u.%u.%u\n",
             st.dev_model, st.dev_connection,
@@ -712,20 +873,9 @@ static void log_status(void)
             st.gcfg.name,
             (unsigned long)st.gcfg_reads, (unsigned long)st.gcfg_errors);
     /* 配置指纹（0xA1/A2）+ RAM 元数据（0xA3 子 1）+ 写入计数 + 命令队列。 */
-    brg_log("[FP] slot=%u crc=%04x/%04x/%04x/%04x g=%04x pushes=%lu meta=%02x r%u len=%u crc32=%08lx sw=%lu sv=%lu rs=%lu cal=%lu/%lu/%lu q=%u/%lu\n",
-            st.fp.active_slot, st.fp.slot_crc[0], st.fp.slot_crc[1],
-            st.fp.slot_crc[2], st.fp.slot_crc[3], st.fp.global_crc,
-            (unsigned long)st.fp.push_count, st.meta.status, st.meta.ram,
-            st.meta.len, (unsigned long)st.meta.crc32,
-            (unsigned long)st.fp.switches, (unsigned long)st.ops.save_replies,
-            (unsigned long)st.ops.reset_replies, (unsigned long)st.ops.calib_starts,
-            (unsigned long)st.ops.calib_finishes, (unsigned long)st.ops.calib_replies,
-            (unsigned)flydigi_host_cmdq_depth(), (unsigned long)st.q_drops);
+    log_line_fp(&st);
     /* 拼接帧嫌疑（接收器偶发把 XInput 载荷拼进 EF 帧）。 */
-    brg_log("[GLTCH] zero_imu=%lu splice=%lu sp=%02x%02x%02x%02x\n",
-            (unsigned long)st.glitch.zero_imu, (unsigned long)st.glitch.splice,
-            st.glitch.last_splice_raw[13], st.glitch.last_splice_raw[14],
-            st.glitch.last_splice_raw[15], st.glitch.last_splice_raw[16]);
+    log_line_gltch(&st);
     /* 官方字段写（0xA0）应答：'S'=field32 睡眠；1/2/4/8=field33 回报率 */
     brg_log("[A0] replies=%lu status=%u field=%u\n",
             (unsigned long)st.a0_replies, st.a0_last_status, st.a0_last_field);
@@ -1061,43 +1211,80 @@ static unsigned st_fp_slot_for_save(void)
     return st.fp.valid ? (unsigned)st.fp.active_slot + 1u : 0u;
 }
 
+/* ---- 控制台参数命令（数据驱动）：触发键 → 收几位 / 取值范围 / 应用函数 ---- */
+typedef struct {
+    char key;              /* 触发键 */
+    uint8_t max_digits;    /* 最多收几位（k=1，j=2） */
+    unsigned min_value, max_value;
+    void (*apply)(unsigned value);
+} console_arg_cmd_t;
+
+static void console_apply_slot(unsigned value)
+{
+    flydigi_host_request_switch_slot((uint8_t)(value - 1u));
+    brg_log("[CMD] switch slot %u queued\n", value);
+}
+
+static void console_apply_jsres(unsigned value)
+{
+    flydigi_host_request_field(FD_FIELD_JS_RESOLUTION, (uint16_t)value);
+    brg_log("[CMD] jsResolution=%u queued\n", value);
+}
+
+static const console_arg_cmd_t s_arg_cmds[] = { { 'k', 1, 1, 4, console_apply_slot },
+                                                { 'j', 2, 8, 12, console_apply_jsres } };
+
+static const console_arg_cmd_t *console_arg_find(char key)
+{
+    for (unsigned i = 0; i < sizeof s_arg_cmds / sizeof s_arg_cmds[0]; i++)
+        if (s_arg_cmds[i].key == key) return &s_arg_cmds[i];
+    return NULL;
+}
+
+/* 参数收集器：s_arg_spec 非 NULL = 参数模式（收数字，满位/非数字/超时即结算）。 */
+static const console_arg_cmd_t *s_arg_spec;
+static char s_arg_buf[3];
+static uint8_t s_arg_len;
+static uint32_t s_arg_deadline;
+
+/* 进入参数模式；提示语逐字保留。 */
+static void console_arg_arm(const console_arg_cmd_t *spec)
+{
+    s_arg_spec = spec;
+    s_arg_len = 0;
+    s_arg_deadline = to_ms_since_boot(get_absolute_time()) + 400u;
+    switch (spec->key) {
+    case 'k': brg_log("[CMD] 槽位? （1..4）\n"); break;
+    case 'j': brg_log("[CMD] jsResolution? （8..12）\n"); break;
+    default: break;
+    }
+}
+
 static void console_task(void)
 {
-    /* 两键参数命令（'k'+槽位 1 位；'j'+分辨率 1-2 位）：收数字，
-     * 满位/非数字/超时即结算。参数模式下暂不处理其它键。 */
-    static char s_arg_key;
-    static char s_arg_buf[3];
-    static uint8_t s_arg_len;
-    static uint32_t s_arg_deadline;
-    if (s_arg_key != 0) {
+    if (s_arg_spec != NULL) {
         uint32_t const now = to_ms_since_boot(get_absolute_time());
         int32_t const ch = tud_cdc_read_char();
         bool settle = false;
-        if (ch >= 0 && ch >= '0' && ch <= '9' && s_arg_len < 2u) {
+        if (ch >= 0 && ch >= '0' && ch <= '9' && s_arg_len < s_arg_spec->max_digits) {
             s_arg_buf[s_arg_len++] = (char)ch;
             s_arg_deadline = now + 400u;
-            if (s_arg_len >= 2u) settle = true;
+            if (s_arg_len >= s_arg_spec->max_digits) settle = true;   /* 满位即结算 */
         } else if (ch >= 0) {
             settle = true;                       /* 非数字：按已收内容结算 */
         } else if ((int32_t)(now - s_arg_deadline) >= 0) {
             settle = true;                       /* 超时 */
         }
-        if (s_arg_key == 'k' && s_arg_len >= 1u) settle = true;  /* 槽位只收 1 位 */
         if (settle) {
             s_arg_buf[s_arg_len] = '\0';
             unsigned val = 0;
             for (uint8_t i = 0; i < s_arg_len; i++)
                 val = val * 10u + (unsigned)(s_arg_buf[i] - '0');
-            if (s_arg_key == 'k' && val >= 1u && val <= 4u) {
-                flydigi_host_request_switch_slot((uint8_t)(val - 1u));
-                brg_log("[CMD] switch slot %u queued\n", val);
-            } else if (s_arg_key == 'j' && val >= 8u && val <= 12u) {
-                flydigi_host_request_field(FD_FIELD_JS_RESOLUTION, (uint16_t)val);
-                brg_log("[CMD] jsResolution=%u queued\n", val);
-            } else {
+            if (val >= s_arg_spec->min_value && val <= s_arg_spec->max_value)
+                s_arg_spec->apply(val);
+            else
                 brg_log("[CMD] 参数无效（k:1..4 / j:8..12），已取消\n");
-            }
-            s_arg_key = 0;
+            s_arg_spec = NULL;
             s_arg_len = 0;
         }
         return;
@@ -1134,10 +1321,14 @@ static void console_task(void)
             }
             break;
         }
-        case 'k': s_arg_key = 'k'; s_arg_len = 0; s_arg_deadline = to_ms_since_boot(get_absolute_time()) + 400u;
-                  brg_log("[CMD] 槽位? （1..4）\n"); return;   /* 交回参数模式，防止后续数字被主开关吞掉 */
-        case 'j': s_arg_key = 'j'; s_arg_len = 0; s_arg_deadline = to_ms_since_boot(get_absolute_time()) + 400u;
-                  brg_log("[CMD] jsResolution? （8..12）\n"); return;
+        case 'k': case 'j': {
+            const console_arg_cmd_t *spec = console_arg_find((char)c);
+            if (spec != NULL) {
+                console_arg_arm(spec);
+                return;   /* 交回参数模式，防止后续数字被主开关吞掉 */
+            }
+            break;
+        }
         case 'T': flydigi_host_request_thirdparty_restore();
                   brg_log("[CMD] allowThirdparty=1 restore queued（0xAF 重置实验保底）\n"); break;
         case 'Z': {
@@ -1280,7 +1471,7 @@ int main(void)
             next_log_ms = ms + 2000;
             if (tud_cdc_connected()) {
                 if (!s_banner_done) { s_banner_done = true; log_banner(); }
-                log_status();
+                log_status_brief();
             }
         }
 #ifdef BRINGUP_MS

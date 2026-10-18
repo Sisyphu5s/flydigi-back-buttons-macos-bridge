@@ -20,6 +20,7 @@
 - WebHID 新增命令 `0x08 GET_GCFG / 0x09 SET_SLEEP / 0x0A SET_RATE`；配置页新增「接收器全局配置」面板（读写回报率与睡眠）。
 - 探针新增 `--gcfg / --set-sleep=N / --set-rate=N`。
 - CDC TX 缓冲区 512 → 4096，修复心跳状态尾部丢行（`[A0]/[AGE]/[POWER]/[OPEN]`）。
+- 内部重构（行为零变化）：协议帧构造器 + golden 帧测试（`firmware/src/flydigi_cmd.*`）、命令队列调度器、应答/命令分发表、状态新域分组；`[FP]` 行新增队列观测 `q=`；移除 0x03 硬件状态死链与旧设备信息解析、控制台 `s` 键；网页协议层整理并采用真机 golden 夹具；CDC 心跳由全量 16 行改为 `[BRG] xr` / `[FP]` / `[GLTCH]` 3 行（`i` 仍为全量）。
 
 ## v0.1.0 - 2026-09-30
 
