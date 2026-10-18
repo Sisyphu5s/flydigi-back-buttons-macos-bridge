@@ -115,6 +115,25 @@ int main(void)
           sleep_min == 15 && rate_field == 2 && prec == 3 && sens == 4,
           "硬件状态：睡眠 15 分钟 / 报告率字段 2 / 精度 3 / 灵敏度 4");
 
+    /* 全局配置 blob（80B，官方 0xA3 读 RAM1 slice(2,82)）字段解码 */
+    uint8_t blob80[80] = {0};
+    blob80[3] = 15;                        /* 睡眠 15 分钟 */
+    blob80[7] = 'V'; blob80[8] = 'P'; blob80[9] = 'r'; blob80[10] = 0;
+    blob80[41] = 0xF4; blob80[42] = 0x01;  /* u16LE = 500 → 500Hz */
+    blob80[43] = 10;                       /* 摇杆精度 10bit */
+    blob80[47] = 1;                        /* 允许第三方接管 */
+    flydigi_gcfg_t gcfg;
+    CHECK(flydigi_gcfg_parse(blob80, &gcfg) && gcfg.report_rate_hz == 500 &&
+          gcfg.sleep_minutes == 15 && gcfg.allow_thirdparty && gcfg.js_resolution == 10 &&
+          strcmp(gcfg.name, "VPr") == 0,
+          "全局配置：500Hz / 睡眠 15 / 接管开 / 10bit / 名称 VPr");
+    blob80[41] = 0x00; blob80[42] = 0x00;
+    CHECK(flydigi_gcfg_parse(blob80, &gcfg) && gcfg.report_rate_hz == 1000,
+          "全局配置：回报率非 500/250/125 → 默认 1000Hz");
+    blob80[43] = 7;
+    CHECK(flydigi_gcfg_parse(blob80, &gcfg) && gcfg.js_resolution == 12,
+          "全局配置：精度非法值 → 默认 12bit");
+
     static const uint8_t trigger_spike[20] = {
         0x00, 0x14, 0x00, 0x00, 0xd6, 0xff,
     };

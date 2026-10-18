@@ -83,6 +83,18 @@ bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes
                           uint8_t *report_rate, uint8_t *precision,
                           uint8_t *sensitivity);
 
+/* 全局配置（官方 0xA3 读 RAM1 后取偏移 2..82 的 80 字节 blob）字段解码。 */
+typedef struct {
+    uint16_t report_rate_hz;     /* @41 u16LE：500/250/125 有效，其它值视为 1000 */
+    uint8_t  sleep_minutes;      /* @3（0 = 永不） */
+    bool     allow_thirdparty;   /* @47 == 1 */
+    uint8_t  js_resolution;      /* @43：8..12，否则 12 */
+    char     name[17];           /* @7..38 UTF-8，取前 16 字节，非可见字符替换为 '.' */
+    uint8_t  raw[80];            /* 原始 80 字节（供诊断/差分） */
+} flydigi_gcfg_t;
+
+bool flydigi_gcfg_parse(const uint8_t *blob80, flydigi_gcfg_t *out);
+
 /* Reject the receiver's observed all-idle XInput packet with both triggers
  * high when a recent EF frame confirms they are released. */
 bool flydigi_rx_xinput_idle_spike(const uint8_t *buf, size_t len,

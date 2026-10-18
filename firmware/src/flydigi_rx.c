@@ -107,6 +107,28 @@ bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes
     return true;
 }
 
+bool flydigi_gcfg_parse(const uint8_t *blob80, flydigi_gcfg_t *out)
+{
+    if (blob80 == NULL || out == NULL) return false;
+
+    uint16_t const rate = (uint16_t)(blob80[41] | ((uint16_t)blob80[42] << 8));
+    out->report_rate_hz = (rate == 500u || rate == 250u || rate == 125u) ? rate : 1000u;
+    out->sleep_minutes = blob80[3];
+    out->allow_thirdparty = blob80[47] == 1u;
+    uint8_t const res = blob80[43];
+    out->js_resolution = (res >= 8u && res <= 12u) ? res : 12u;
+
+    unsigned ni = 0;
+    for (; ni < 16u && blob80[7 + ni] != 0; ni++) {
+        uint8_t const c = blob80[7 + ni];
+        out->name[ni] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    out->name[ni] = '\0';
+
+    memcpy(out->raw, blob80, sizeof out->raw);
+    return true;
+}
+
 bool flydigi_rx_xinput_idle_spike(const uint8_t *buf, size_t len,
                                  const flydigi_rx_state_t *ext, bool ext_recent)
 {

@@ -96,6 +96,11 @@ typedef struct {
     uint8_t  hw_sleep_minutes, hw_report_rate;
     uint8_t  hw_stick_precision, hw_stick_sensitivity;
     uint32_t hw_status_replies;
+
+    /* 全局配置（0xA3 读 RAM1 → slice(2,82) 的 80B blob，控制台 'g'）。 */
+    bool     gcfg_valid;
+    uint32_t gcfg_reads, gcfg_errors;
+    flydigi_gcfg_t gcfg;
     uint8_t  rumble_ack_left, rumble_ack_right; /* last successful OUT transfer */
     uint32_t xinput_min_interval_us, xinput_max_interval_us;
     uint32_t ext_min_interval_us, ext_max_interval_us;
@@ -158,6 +163,9 @@ void flydigi_host_request_sleep_never(void);
 
 /* 写入报告率（控制台 1/2/4/8，cmd 14）：{1:1000, 2:500, 4:250, 8:125} Hz */
 void flydigi_host_request_report_rate(uint8_t value);
+
+/* 读取全局配置（控制台 'g'）：0xA3 分块读 RAM1 → slice(2,82) → 字段解析 */
+void flydigi_host_request_global_config(void);
 
 /* One-shot SDL-style acquire/release probe on the receiver's command endpoint. */
 void flydigi_host_acquire_probe(bool acquire);

@@ -41,6 +41,12 @@ static volatile bool s_sleep_never_pending; /* 按需发送 cmd 17（睡眠=永�
 static volatile bool s_rate_pending;        /* 按需发送 cmd 14（报告率） */
 static volatile uint8_t s_rate_value;       /* {1:1000, 2:500, 4:250, 8:125} Hz */
 static uint32_t s_acquire_keepalive_ms;     /* 上次 acquire 发送时刻（30s 保活） */
+static volatile bool s_gcfg_pending;        /* 按需启动全局配置读取（0xA3 读 RAM1） */
+static bool s_gcfg_active;                  /* 读取进行中 */
+static bool s_gcfg_waiting;                 /* 有分块请求在途 */
+static uint8_t s_gcfg_chunk;                /* 下一分块索引 */
+static uint8_t s_gcfg_buf[96];              /* 6×16B 拼装缓冲（覆盖 82B 需求） */
+static uint32_t s_gcfg_last_ms;             /* 超时基准 */
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_rumble_left, s_rumble_right;
@@ -184,6 +190,12 @@ static void fd_clear_device_state(void)
     s_acquire_auto_done = false;
     s_sleep_never_pending = false;
     s_rate_pending = false;
+    s_gcfg_pending = false;
+    s_gcfg_active = false;
+    s_gcfg_waiting = false;
+    g_fd.gcfg_valid = false;
+    g_fd.gcfg_reads = 0;
+    g_fd.gcfg_errors = 0;
     g_fd.rumble_ack_left = 0;
     g_fd.rumble_ack_right = 0;
     g_fd.ext_frame_seen = false;
@@ -644,6 +656,38 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             g_fd.takeover_status_replies++;
             g_fd.takeover_enabled = slot->in_buf[9];
         }
+        if (slot->in_buf[2] == 0xa3 && s_gcfg_active && s_gcfg_waiting) {
+            /* v2.1 应答：payload 自 [3] 起 = subop,status,ramId,activeSlot,
+             * totalLen.u16,chunkIdx,chunkSize,data…（官方 core pt/te 布局） */
+            s_gcfg_waiting = false;
+            uint8_t const subop = slot->in_buf[3];
+            uint8_t const status = slot->in_buf[4];
+            uint8_t const cidx = slot->in_buf[9];
+            uint8_t const csize = slot->in_buf[10];
+            if (subop == 0x00 && status == 0 && cidx == s_gcfg_chunk && csize <= 16u) {
+                memcpy(&s_gcfg_buf[(uint32_t)cidx * 16u], &slot->in_buf[11], csize);
+                s_gcfg_last_ms = now_ms();
+                s_gcfg_chunk++;
+                uint32_t const got = (uint32_t)cidx * 16u + csize;
+                if (got >= 82u) {           /* 已覆盖 slice(2,82) 所需 80B 数据 */
+                    flydigi_gcfg_t parsed;
+                    if (flydigi_gcfg_parse(&s_gcfg_buf[2], &parsed)) {
+                        g_fd.gcfg = parsed;
+                        g_fd.gcfg_valid = true;
+                        g_fd.gcfg_reads++;
+                    } else {
+                        g_fd.gcfg_errors++;
+                    }
+                    s_gcfg_active = false;
+                } else if (s_gcfg_chunk >= 6u) {
+                    g_fd.gcfg_errors++;     /* 数据不足 82B */
+                    s_gcfg_active = false;
+                }
+            } else {
+                g_fd.gcfg_errors++;         /* 错误状态或乱序分块 */
+                s_gcfg_active = false;
+            }
+        }
         uint8_t dev_model, dev_connection;
         uint16_t dev_fw;
         if (flydigi_rx_device_info(slot->in_buf, FD_RX_FRAME_BYTES,
@@ -808,7 +852,9 @@ static void fd_send_cmds(void)
     acquire_value = s_acquire_value;
     critical_section_exit(&s_state_lock);
     if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_never_pending &&
-         !s_rate_pending) || s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
+         !s_rate_pending && !s_gcfg_pending &&
+         !(s_gcfg_active && !s_gcfg_waiting)) ||
+        s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
         if ((int32_t)(now_ms() - s_ex.cmd_next_ms) < 0) return;
     }
     if (!usbh_edpt_claim(s_ex.daddr, s_ex.ep_out)) { g_fd.cmd_claim_fail++; return; }
@@ -835,6 +881,28 @@ static void fd_send_cmds(void)
         s_ex.cmd_buf[4] = s_rate_value;
         s_ex.cmd_buf[5] = (uint8_t)(0x14u + 0x03u + s_rate_value);
         s_rate_pending = false;
+    } else if ((s_gcfg_pending || (s_gcfg_active && !s_gcfg_waiting)) &&
+               s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 全局配置读取：0xA3 READ_CHUNK（ramId=1，16B/块），应答驱动连读。 */
+        if (s_gcfg_pending) {
+            s_gcfg_pending = false;
+            s_gcfg_active = true;
+            s_gcfg_chunk = 0;
+            memset(s_gcfg_buf, 0, sizeof s_gcfg_buf);
+        }
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa3;
+        s_ex.cmd_buf[3] = 0x06;             /* len = 2 + 4 载荷 */
+        s_ex.cmd_buf[4] = 0x00;             /* 子操作 READ_CHUNK */
+        s_ex.cmd_buf[5] = 0x01;             /* ramId 1 = 全局配置 */
+        s_ex.cmd_buf[6] = s_gcfg_chunk;
+        s_ex.cmd_buf[7] = 0x10;             /* chunkSize 16 */
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 7u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[8] = cs;
+        s_gcfg_waiting = true;
+        s_gcfg_last_ms = now_ms();
     } else if (s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         if (s_hwinfo_pending) {
             /* 按需读硬件状态（cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
@@ -915,6 +983,12 @@ void flydigi_host_task(void)
         s_acquire_value = true;
         s_acquire_pending = true;
         critical_section_exit(&s_state_lock);
+    }
+    /* 全局配置读取超时保护：2 秒无应答即终止并计数 */
+    if (s_gcfg_active && (int32_t)(ms - s_gcfg_last_ms) >= 2000) {
+        s_gcfg_active = false;
+        s_gcfg_waiting = false;
+        g_fd.gcfg_errors++;
     }
     uint32_t ext_us_snapshot;
     bool resend_requested;
@@ -1026,6 +1100,11 @@ void flydigi_host_request_report_rate(uint8_t value)
 {
     s_rate_value = value;
     s_rate_pending = true;
+}
+
+void flydigi_host_request_global_config(void)
+{
+    s_gcfg_pending = true;
 }
 
 void flydigi_host_acquire_probe(bool acquire)

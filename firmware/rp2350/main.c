@@ -559,6 +559,11 @@ static void log_status(void)
             st.hw_sleep_minutes, st.hw_report_rate,
             st.hw_stick_precision, st.hw_stick_sensitivity,
             (unsigned long)st.hw_status_replies);
+    /* 全局配置 blob（0xA3 读回，官方字段语义）：'g' 触发一次读取后刷新 */
+    brg_log("[CFG] rate=%uHz sleep_min=%u thirdparty=%u jsres=%u name=%s reads=%lu err=%lu\n",
+            st.gcfg.report_rate_hz, st.gcfg.sleep_minutes,
+            st.gcfg.allow_thirdparty ? 1u : 0u, st.gcfg.js_resolution, st.gcfg.name,
+            (unsigned long)st.gcfg_reads, (unsigned long)st.gcfg_errors);
     /* 输入新鲜度：接收器回调 → USB 入队的年龄（只在内容变化时采样）。 */
     brg_log("[AGE] input_us last=%lu min=%lu max=%lu n=%lu\n",
             (unsigned long)s_bridge_age_last_us, (unsigned long)s_bridge_age_min_us,
@@ -764,7 +769,7 @@ static void log_banner(void)
     brg_log("identity: VID=%04x PID=%04x bcdDevice=%04x  HID report=%u B, %u bytes\n",
          BRIDGE_USB_VID, BRIDGE_USB_PID, BRIDGE_USB_BCD,
          (unsigned)sizeof(BRIDGE_GAMEPAD_DESC), VADER2PRO_REPORT_BYTES);
-    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status S=sleep-never 1/2/4/8=rate R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
+    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status S=sleep-never 1/2/4/8=rate g=gcfg R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
 }
 
 static void log_raw(void)
@@ -812,6 +817,12 @@ static void log_raw(void)
     brg_log("\n");
     brg_log("[RAW] last reply    :");
     for (unsigned i = 0; i < FD_RX_FRAME_BYTES; i++) brg_log(" %02x", st.last_reply_raw[i]);
+    brg_log("\n");
+    brg_log("[RAW] gcfg[0..39]  :");
+    for (unsigned i = 0; i < 40u; i++) brg_log(" %02x", st.gcfg.raw[i]);
+    brg_log("\n");
+    brg_log("[RAW] gcfg[40..79] :");
+    for (unsigned i = 40u; i < 80u; i++) brg_log(" %02x", st.gcfg.raw[i]);
     brg_log("\n");
     brg_log("[RAW] last HID rep :");
     for (unsigned i = 0; i < VADER2PRO_REPORT_BYTES; i++) brg_log(" %02x", s_last_rep[i]);
@@ -890,6 +901,7 @@ static void console_task(void)
         case '2': flydigi_host_request_report_rate(2); brg_log("[CMD] report rate 500 Hz queued\n"); break;
         case '4': flydigi_host_request_report_rate(4); brg_log("[CMD] report rate 250 Hz queued\n"); break;
         case '8': flydigi_host_request_report_rate(8); brg_log("[CMD] report rate 125 Hz queued\n"); break;
+        case 'g': flydigi_host_request_global_config(); brg_log("[CMD] global config read queued\n"); break;
         case 'A': flydigi_host_acquire_probe(true); brg_log("[CMD] acquire queued\n"); break;
         case 'U': flydigi_host_acquire_probe(false); brg_log("[CMD] release queued\n"); break;
         case 'R': flydigi_host_rumble(255, 255); brg_log("[CMD] rumble test queued\n"); break;
