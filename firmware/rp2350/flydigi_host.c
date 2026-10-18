@@ -17,6 +17,7 @@
 #include "host/usbh.h"
 #include "host/usbh_pvt.h"
 #include "flydigi_host.h"
+#include "flydigi_cmd.h"
 #include "bridge_config.h"
 #include "rumble_report.h"
 #include "pico/critical_section.h"
@@ -34,14 +35,8 @@ static uint32_t s_base_us;             /* 最后一次接口 0 有效报文 */
 static uint32_t s_ext_us;              /* 最后一次 EF 帧 */
 static critical_section_t s_state_lock;
 static volatile bool s_resend_requested;
-static volatile bool s_hwinfo_pending;      /* 按需发送 cmd 03（硬件状态） */
-static bool s_hwinfo_auto_done;             /* 开机后自动补发只做一次 */
 static bool s_acquire_auto_done;            /* 开机自动声明接管（高帧率流）只做一次 */
-static volatile bool s_sleep_pending;       /* 按需写睡眠（0xA0 field 32） */
-static volatile uint8_t s_sleep_minutes;    /* 0 = 永不 */
 static bool s_sleep_auto_done;              /* 每挂载自愈一次（读到非 0 才写） */
-static volatile bool s_rate_pending;        /* 按需写报告率（0xA0 field 33） */
-static volatile uint16_t s_rate_hz;
 static bool s_gcfg_auto_done;               /* 每挂载自动读一次全局配置 */
 static uint32_t s_acquire_keepalive_ms;     /* 上次 acquire 发送时刻（30s 保活） */
 static volatile bool s_gcfg_pending;        /* 按需启动全局配置读取（0xA3 读 RAM1） */
@@ -53,28 +48,6 @@ static uint32_t s_gcfg_last_ms;             /* 超时基准 */
 static uint32_t s_gcfg_read_ms;             /* 上次读取完成时刻（A1 推送自动重读的速率限制） */
 static volatile bool s_gcfg_stale;          /* A1 推送：设备端配置已变化，待重读 */
 static bool s_fp_awaiting_reply;            /* 刚发过 0xA1 查询（区分应答与推送） */
-static uint32_t s_fp_push_count;            /* 0xA1 主动推送计数 */
-/* 官方扩展命令（2026-10-18 二次核对）：SKU/指纹/元数据/切槽/保存/重置/校准/状态位/字段写/名称 */
-static volatile bool s_sku_pending;         /* 0x0F */
-static volatile bool s_fp_pending;          /* 0xA1 */
-static volatile bool s_meta_pending;        /* 0xA3 子操作 1 */
-static volatile uint8_t s_meta_ram;         /*    目标 ramId（1=全局配置，5=映射） */
-static volatile bool s_slot_pending;        /* 0xA2 */
-static volatile uint8_t s_slot_value;
-static volatile bool s_save_pending;        /* 0xA7（探测） */
-static volatile uint8_t s_save_slot;
-static volatile bool s_reset_pending;       /* 0xAF（探测） */
-static volatile uint8_t s_reset_value;
-static volatile bool s_calib_pending;       /* 0x34 */
-static volatile bool s_calib_start;
-static volatile bool s_status_set_pending;  /* 0x11（探索） */
-static volatile uint8_t s_status_set_value[3];
-static volatile bool s_field_pending;       /* 0xA0 通用字段写 */
-static volatile uint8_t s_field_id;
-static volatile uint16_t s_field_value;
-static volatile bool s_name_pending;        /* 0xA0 field 1 文本 */
-static char s_name_text[17];
-static uint8_t s_name_len;
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
 static uint8_t s_rumble_left, s_rumble_right;
@@ -90,6 +63,80 @@ static flydigi_rx_state_t s_trace_previous[2];
 static bool s_trace_valid[2];
 static uint32_t s_trace_sequence;
 static uint8_t s_trace_count;
+
+/* ===================== 命令帧队列 =====================
+ * 写入类命令（0xA0/0x0F/0xA1/0xA2/0xA3 元数据/0xA7/0xAF/0x34/0x11）统一先建帧入队，
+ * 启动序列完成后由 fd_send_cmds 按 FIFO 发出；满则丢弃并 g_fd.q_drops++。
+ * 队列由 core1 的发送路径消费，但 push 也可能来自 core0（控制台/WebHID），
+ * 故 push/pop/depth 沿用 s_state_lock（与 s_acquire_* 相同模式），避免跨核撕裂帧。 */
+#define FD_CMDQ_DEPTH 8u
+
+/* 发送提交前按 tag 施加的副作用（与旧发送分支“分支内先置副作用再提交”顺序一致） */
+enum {
+    TAG_NONE = 0,
+    TAG_FP_QUERY,       /* 0xA1 指纹查询：置 s_fp_awaiting_reply（区分应答与推送） */
+    TAG_SLOT_SWITCH,    /* 0xA2 切槽：slot_switches++ */
+    TAG_CALIB_START,    /* 0x34 开始：calib_starts++ */
+    TAG_CALIB_FINISH,   /* 0x34 结束：calib_finishes++ */
+    TAG_STATUS_SET,     /* 0x11 SET_STATUS：status_set_sent++ */
+};
+
+typedef struct {
+    uint8_t frame[FD_CMD_BYTES];
+    uint8_t tag;
+} fd_cmdq_entry_t;
+
+typedef struct {
+    fd_cmdq_entry_t e[FD_CMDQ_DEPTH];
+    uint8_t head;                   /* 出队位置 */
+    uint8_t count;                  /* 当前元素数 */
+} fd_cmdq_t;
+
+static fd_cmdq_t s_cmdq;
+
+static bool fd_cmdq_push(const uint8_t frame[FD_CMD_BYTES], uint8_t tag)
+{
+    critical_section_enter_blocking(&s_state_lock);
+    bool const ok = s_cmdq.count < FD_CMDQ_DEPTH;
+    if (ok) {
+        fd_cmdq_entry_t *e = &s_cmdq.e[(s_cmdq.head + s_cmdq.count) % FD_CMDQ_DEPTH];
+        memcpy(e->frame, frame, FD_CMD_BYTES);
+        e->tag = tag;
+        s_cmdq.count++;
+    } else {
+        g_fd.q_drops++;
+    }
+    critical_section_exit(&s_state_lock);
+    return ok;
+}
+
+static bool fd_cmdq_pop(uint8_t out[FD_CMD_BYTES], uint8_t *tag)
+{
+    critical_section_enter_blocking(&s_state_lock);
+    bool const ok = s_cmdq.count > 0;
+    if (ok) {
+        fd_cmdq_entry_t const *e = &s_cmdq.e[s_cmdq.head];
+        memcpy(out, e->frame, FD_CMD_BYTES);
+        if (tag != NULL) *tag = e->tag;
+        s_cmdq.head = (uint8_t)((s_cmdq.head + 1u) % FD_CMDQ_DEPTH);
+        s_cmdq.count--;
+    }
+    critical_section_exit(&s_state_lock);
+    return ok;
+}
+
+static uint32_t fd_cmdq_depth(void)
+{
+    critical_section_enter_blocking(&s_state_lock);
+    uint32_t const n = s_cmdq.count;
+    critical_section_exit(&s_state_lock);
+    return n;
+}
+
+uint32_t flydigi_host_cmdq_depth(void)
+{
+    return fd_cmdq_depth();
+}
 
 static bool axis_moved(int16_t current, int16_t previous)
 {
@@ -186,6 +233,9 @@ static void fd_clear_device_state(void)
     /* Keep a zero packet queued so a receiver that latched rumble is stopped
      * after it comes back, even if it disappeared while the endpoint was busy. */
     s_rumble_pending = true;
+    /* 断连时丢弃排队未发的写入命令（等价于旧实现清零全部 pending 标志）。 */
+    s_cmdq.head = 0;
+    s_cmdq.count = 0;
     s_trace_valid[0] = s_trace_valid[1] = false;
     s_trace_count = 0;
     s_trace_sequence = 0;
@@ -211,34 +261,18 @@ static void fd_clear_device_state(void)
     g_fd.battery_percent = 0;
     g_fd.battery_state = 0;
     g_fd.dev_info_valid = false;
-    g_fd.hw_status_valid = false;
-    g_fd.hw_status_replies = 0;
-    s_hwinfo_pending = false;
-    s_hwinfo_auto_done = false;
     s_acquire_auto_done = false;
-    s_sleep_pending = false;
     s_sleep_auto_done = false;
-    s_rate_pending = false;
     s_gcfg_auto_done = false;
     s_gcfg_pending = false;
     s_gcfg_active = false;
     s_gcfg_waiting = false;
     s_gcfg_stale = false;
     s_fp_awaiting_reply = false;
-    s_sku_pending = false;
-    s_fp_pending = false;
-    s_meta_pending = false;
-    s_slot_pending = false;
-    s_save_pending = false;
-    s_reset_pending = false;
-    s_calib_pending = false;
-    s_status_set_pending = false;
-    s_field_pending = false;
-    s_name_pending = false;
-    g_fd.sku_valid = false;
-    g_fd.fp_valid = false;
-    g_fd.meta_replies = 0;
-    g_fd.dev_ex_valid = false;
+    g_fd.sku.valid = false;
+    g_fd.fp.valid = false;
+    g_fd.meta.replies = 0;
+    g_fd.dev_ext.valid = false;
     g_fd.gcfg_valid = false;
     g_fd.gcfg_reads = 0;
     g_fd.gcfg_errors = 0;
@@ -669,6 +703,169 @@ static bool fd_ex_set_config(uint8_t dev_addr, uint8_t itf_num)
     return true;
 }
 
+/* ---------- 应答分发：5a a5 <cmd> …（逐条迁移自旧 if 链） ---------- */
+
+/* 0x01 设备信息（型号/连接/固件）与电量 nibble（后者自带 cmd 校验）。 */
+static void fd_reply_01(const uint8_t *b, uint32_t n)
+{
+    flydigi_dev_info_t ex;
+    if (flydigi_rx_device_info_ex(b, FD_RX_FRAME_BYTES, &ex)) {
+        g_fd.dev_ext.ex = ex;
+        g_fd.dev_ext.valid = true;
+        g_fd.dev_ext.replies++;
+        /* 旧扁平字段由全量解析同步填充（同字节位：model[5]/conn[6]/fw[15..16]）。 */
+        g_fd.dev_model = ex.model;
+        g_fd.dev_connection = ex.connection;
+        g_fd.dev_fw_version = ex.fw_main;
+        g_fd.dev_info_valid = true;
+    }
+    uint8_t battery_percent, power_state;
+    if (flydigi_rx_battery_status(b, n, &battery_percent, &power_state)) {
+        g_fd.battery_valid = true;
+        g_fd.battery_percent = battery_percent;
+        g_fd.battery_state = power_state;
+        g_fd.battery_updates++;
+        s_battery_us = now_us();
+    }
+}
+
+/* 0x0F SKU 名称应答（官方 Rn 同布局）：payload[0]=value，[1..20]=名称。 */
+static void fd_reply_0f(const uint8_t *b)
+{
+    uint8_t val;
+    if (flydigi_rx_sku(b, FD_RX_FRAME_BYTES, &val, (char *)g_fd.sku.name)) {
+        g_fd.sku.value = val;
+        g_fd.sku.valid = true;
+        g_fd.sku.replies++;
+    }
+}
+
+/* 0x10 接管状态应答：takeover_enabled。 */
+static void fd_reply_10(const uint8_t *b)
+{
+    g_fd.takeover_status_replies++;
+    g_fd.takeover_enabled = b[9];
+}
+
+/* 0x1C acquire 应答：state/reason。 */
+static void fd_reply_1c(const uint8_t *b)
+{
+    g_fd.acquire_replies++;
+    g_fd.acquire_state = b[5];
+    g_fd.acquire_reason = b[6];
+}
+
+/* 0xA0 字段写应答（v1 布局）：5A A5 A0 pkgCount pkgIndex status fieldId CS */
+static void fd_reply_a0(const uint8_t *b)
+{
+    g_fd.a0_replies++;
+    g_fd.a0_last_status = b[5];
+    g_fd.a0_last_field = b[6];
+}
+
+/* 0xA1 配置指纹：活动槽 + 4×槽 CRC16 + 全局 CRC16。
+ * 查询应答与「设备端配置变更」主动推送共用本命令（官方 Dn 监听同名命令），
+ * 靠 s_fp_awaiting_reply 区分。 */
+static void fd_reply_a1(const uint8_t *b)
+{
+    uint8_t aslot;
+    uint16_t crcs[4], gcrc;
+    if (flydigi_rx_fingerprint(b, FD_RX_FRAME_BYTES, &aslot, crcs, &gcrc)) {
+        g_fd.fp.valid = true;
+        g_fd.fp.active_slot = aslot;
+        for (unsigned i = 0; i < 4u; i++) g_fd.fp.slot_crc[i] = crcs[i];
+        g_fd.fp.global_crc = gcrc;
+        g_fd.fp.replies++;
+        if (s_fp_awaiting_reply) {
+            s_fp_awaiting_reply = false;   /* 我方查询的应答 */
+        } else {
+            /* 主动推送：设备端配置已变化 → 触发自动重读 */
+            g_fd.fp.push_count++;
+            s_gcfg_stale = true;
+        }
+    }
+}
+
+/* 0xA2 切槽应答：与指纹同布局，单独计数。 */
+static void fd_reply_a2(const uint8_t *b)
+{
+    uint8_t aslot;
+    uint16_t crcs[4], gcrc;
+    if (flydigi_rx_fingerprint(b, FD_RX_FRAME_BYTES, &aslot, crcs, &gcrc)) {
+        g_fd.fp.valid = true;
+        g_fd.fp.active_slot = aslot;
+        for (unsigned i = 0; i < 4u; i++) g_fd.fp.slot_crc[i] = crcs[i];
+        g_fd.fp.global_crc = gcrc;
+        g_fd.fp.slot_replies++;
+    }
+}
+
+/* 0xA3：全局配置分块续读（读取中）与子操作 1 RAM 元数据。
+ * 旧实现两个 if 都可命中（元数据帧在读配置期间到达会先记一次 gcfg_errors），
+ * 这里保持同序：先分块状态机，再元数据解析。 */
+static void fd_reply_a3(const uint8_t *b)
+{
+    if (s_gcfg_active && s_gcfg_waiting) {
+        /* v2.1 应答：payload 自 [3] 起 = subop,status,ramId,activeSlot,
+         * totalLen.u16,chunkIdx,chunkSize,data…（官方 core pt/te 布局） */
+        s_gcfg_waiting = false;
+        uint8_t const subop = b[3];
+        uint8_t const status = b[4];
+        uint8_t const cidx = b[9];
+        uint8_t const csize = b[10];
+        if (subop == 0x00 && status == 0 && cidx == s_gcfg_chunk && csize <= 16u) {
+            memcpy(&s_gcfg_buf[(uint32_t)cidx * 16u], &b[11], csize);
+            s_gcfg_last_ms = now_ms();
+            s_gcfg_chunk++;
+            uint32_t const got = (uint32_t)cidx * 16u + csize;
+            if (got >= 82u) {           /* 已覆盖 slice(2,82) 所需 80B 数据 */
+                flydigi_gcfg_t parsed;
+                if (flydigi_gcfg_parse(&s_gcfg_buf[2], &parsed)) {
+                    g_fd.gcfg = parsed;
+                    g_fd.gcfg_valid = true;
+                    g_fd.gcfg_reads++;
+                    /* 自愈：睡眠定时器非 0 → 自动写一次“永不”（每挂载一次） */
+                    if (!s_sleep_auto_done && parsed.sleep_minutes != 0) {
+                        s_sleep_auto_done = true;
+                        flydigi_host_request_field(FD_FIELD_SLEEP, 0);
+                    }
+                } else {
+                    g_fd.gcfg_errors++;
+                }
+                s_gcfg_read_ms = now_ms();
+                s_gcfg_active = false;
+            } else if (s_gcfg_chunk >= 6u) {
+                g_fd.gcfg_errors++;     /* 数据不足 82B */
+                s_gcfg_read_ms = now_ms();
+                s_gcfg_active = false;
+            }
+        } else {
+            g_fd.gcfg_errors++;         /* 错误状态或乱序分块 */
+            s_gcfg_read_ms = now_ms();
+            s_gcfg_active = false;
+        }
+    }
+    if (b[3] == 0x01) {
+        /* RAM 元数据（子操作 1）：状态/ramId/槽/长度/CRC32。 */
+        uint8_t mstatus, mram, mslot;
+        uint16_t mlen;
+        uint32_t mcrc;
+        if (flydigi_rx_ram_meta(b, FD_RX_FRAME_BYTES, &mstatus, &mram, &mslot, &mlen, &mcrc)) {
+            g_fd.meta.status = mstatus;
+            g_fd.meta.ram = mram;
+            g_fd.meta.slot = mslot;
+            g_fd.meta.len = mlen;
+            g_fd.meta.crc32 = mcrc;
+            g_fd.meta.replies++;
+        }
+    }
+}
+
+/* 0xA7 保存 / 0xAF 重置 / 0x34 校准应答：仅计数。 */
+static void fd_reply_a7(void) { g_fd.ops.save_replies++; }
+static void fd_reply_af(void) { g_fd.ops.reset_replies++; }
+static void fd_reply_34(void) { g_fd.ops.calib_replies++; }
+
 static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
     g_fd.ext_xfer_cb++;
@@ -696,151 +893,19 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
     if (xferred_bytes >= FD_RX_FRAME_BYTES && slot->in_buf[0] == 0x5a &&
         slot->in_buf[1] == 0xa5 && slot->in_buf[2] != FD_RX_MAGIC2) {
         memcpy((void *)g_fd.last_reply_raw, slot->in_buf, FD_RX_FRAME_BYTES);
-        if (slot->in_buf[2] == 0x1c) {
-            g_fd.acquire_replies++;
-            g_fd.acquire_state = slot->in_buf[5];
-            g_fd.acquire_reason = slot->in_buf[6];
-        }
-        if (slot->in_buf[2] == 0x10) {
-            g_fd.takeover_status_replies++;
-            g_fd.takeover_enabled = slot->in_buf[9];
-        }
-        if (slot->in_buf[2] == 0xa3 && s_gcfg_active && s_gcfg_waiting) {
-            /* v2.1 应答：payload 自 [3] 起 = subop,status,ramId,activeSlot,
-             * totalLen.u16,chunkIdx,chunkSize,data…（官方 core pt/te 布局） */
-            s_gcfg_waiting = false;
-            uint8_t const subop = slot->in_buf[3];
-            uint8_t const status = slot->in_buf[4];
-            uint8_t const cidx = slot->in_buf[9];
-            uint8_t const csize = slot->in_buf[10];
-            if (subop == 0x00 && status == 0 && cidx == s_gcfg_chunk && csize <= 16u) {
-                memcpy(&s_gcfg_buf[(uint32_t)cidx * 16u], &slot->in_buf[11], csize);
-                s_gcfg_last_ms = now_ms();
-                s_gcfg_chunk++;
-                uint32_t const got = (uint32_t)cidx * 16u + csize;
-                if (got >= 82u) {           /* 已覆盖 slice(2,82) 所需 80B 数据 */
-                    flydigi_gcfg_t parsed;
-                    if (flydigi_gcfg_parse(&s_gcfg_buf[2], &parsed)) {
-                        g_fd.gcfg = parsed;
-                        g_fd.gcfg_valid = true;
-                        g_fd.gcfg_reads++;
-                        /* 自愈：睡眠定时器非 0 → 自动写一次“永不”（每挂载一次） */
-                        if (!s_sleep_auto_done && parsed.sleep_minutes != 0) {
-                            s_sleep_auto_done = true;
-                            s_sleep_minutes = 0;
-                            s_sleep_pending = true;
-                        }
-                    } else {
-                        g_fd.gcfg_errors++;
-                    }
-                    s_gcfg_read_ms = now_ms();
-                    s_gcfg_active = false;
-                } else if (s_gcfg_chunk >= 6u) {
-                    g_fd.gcfg_errors++;     /* 数据不足 82B */
-                    s_gcfg_read_ms = now_ms();
-                    s_gcfg_active = false;
-                }
-            } else {
-                g_fd.gcfg_errors++;         /* 错误状态或乱序分块 */
-                s_gcfg_read_ms = now_ms();
-                s_gcfg_active = false;
-            }
-        }
-        if (slot->in_buf[2] == 0xa0) {
-            /* 官方字段写应答（v1 布局）：5A A5 A0 pkgCount pkgIndex status fieldId CS */
-            g_fd.a0_replies++;
-            g_fd.a0_last_status = slot->in_buf[5];
-            g_fd.a0_last_field = slot->in_buf[6];
-        }
-        if (slot->in_buf[2] == 0x0f) {
-            /* SKU 名称应答（官方 Rn 同布局）：payload[0]=value，[1..20]=名称。 */
-            uint8_t val;
-            if (flydigi_rx_sku(slot->in_buf, FD_RX_FRAME_BYTES, &val,
-                               (char *)g_fd.sku_name)) {
-                g_fd.sku_value = val;
-                g_fd.sku_valid = true;
-                g_fd.sku_replies++;
-            }
-        }
-        if (slot->in_buf[2] == 0xa1 || slot->in_buf[2] == 0xa2) {
-            /* 配置指纹：活动槽 + 4×槽 CRC16 + 全局 CRC16。
-             * 0xA1 同时承担「设备端配置变更」的主动推送（官方 Dn 监听同一命令）。 */
-            uint8_t aslot;
-            uint16_t crcs[4], gcrc;
-            if (flydigi_rx_fingerprint(slot->in_buf, FD_RX_FRAME_BYTES, &aslot, crcs, &gcrc)) {
-                g_fd.fp_valid = true;
-                g_fd.fp_active_slot = aslot;
-                for (unsigned i = 0; i < 4u; i++) g_fd.fp_slot_crc[i] = crcs[i];
-                g_fd.fp_global_crc = gcrc;
-                if (slot->in_buf[2] == 0xa1) {
-                    g_fd.fp_replies++;
-                    if (s_fp_awaiting_reply) {
-                        s_fp_awaiting_reply = false;   /* 我方查询的应答 */
-                    } else {
-                        /* 主动推送：设备端配置已变化 → 触发自动重读 */
-                        s_fp_push_count++;
-                        g_fd.fp_push_count = s_fp_push_count;
-                        s_gcfg_stale = true;
-                    }
-                } else {
-                    g_fd.slot_replies++;
-                }
-            }
-        }
-        if (slot->in_buf[2] == 0xa3 && slot->in_buf[3] == 0x01) {
-            /* RAM 元数据（子操作 1）：状态/ramId/槽/长度/CRC32。 */
-            uint8_t mstatus, mram, mslot;
-            uint16_t mlen;
-            uint32_t mcrc;
-            if (flydigi_rx_ram_meta(slot->in_buf, FD_RX_FRAME_BYTES, &mstatus, &mram,
-                                    &mslot, &mlen, &mcrc)) {
-                g_fd.meta_status = mstatus;
-                g_fd.meta_ram = mram;
-                g_fd.meta_slot = mslot;
-                g_fd.meta_len = mlen;
-                g_fd.meta_crc32 = mcrc;
-                g_fd.meta_replies++;
-            }
-        }
-        if (slot->in_buf[2] == 0xa7) g_fd.save_replies++;
-        if (slot->in_buf[2] == 0xaf) g_fd.reset_replies++;
-        if (slot->in_buf[2] == 0x34) g_fd.calib_replies++;
-        uint8_t dev_model, dev_connection;
-        uint16_t dev_fw;
-        if (flydigi_rx_device_info(slot->in_buf, FD_RX_FRAME_BYTES,
-                                   &dev_model, &dev_connection, &dev_fw)) {
-            g_fd.dev_model = dev_model;
-            g_fd.dev_connection = dev_connection;
-            g_fd.dev_fw_version = dev_fw;
-            g_fd.dev_info_valid = true;
-            /* 全量信息（7 个固件版本 + 芯片 + 陀螺仪 + 能力位）同步解析。 */
-            flydigi_dev_info_t ex;
-            if (flydigi_rx_device_info_ex(slot->in_buf, FD_RX_FRAME_BYTES, &ex)) {
-                g_fd.dev_ex = ex;
-                g_fd.dev_ex_valid = true;
-                g_fd.dev_ex_replies++;
-            }
-        }
-        if (slot->in_buf[2] == 0x03) {
-            uint8_t sleep_min, rate, precision, sensitivity;
-            if (flydigi_rx_hw_status(slot->in_buf, FD_RX_FRAME_BYTES, &sleep_min, &rate,
-                                     &precision, &sensitivity)) {
-                g_fd.hw_sleep_minutes = sleep_min;
-                g_fd.hw_report_rate = rate;
-                g_fd.hw_stick_precision = precision;
-                g_fd.hw_stick_sensitivity = sensitivity;
-                g_fd.hw_status_valid = true;
-                g_fd.hw_status_replies++;
-            }
-        }
-        uint8_t battery_percent, power_state;
-        if (flydigi_rx_battery_status(slot->in_buf, xferred_bytes,
-                                      &battery_percent, &power_state)) {
-            g_fd.battery_valid = true;
-            g_fd.battery_percent = battery_percent;
-            g_fd.battery_state = power_state;
-            g_fd.battery_updates++;
-            s_battery_us = now_us();
+        switch (slot->in_buf[2]) {
+        case 0x01: fd_reply_01(slot->in_buf, xferred_bytes); break;
+        case 0x0f: fd_reply_0f(slot->in_buf); break;
+        case 0x10: fd_reply_10(slot->in_buf); break;
+        case 0x1c: fd_reply_1c(slot->in_buf); break;
+        case 0xa0: fd_reply_a0(slot->in_buf); break;
+        case 0xa1: fd_reply_a1(slot->in_buf); break;
+        case 0xa2: fd_reply_a2(slot->in_buf); break;
+        case 0xa3: fd_reply_a3(slot->in_buf); break;
+        case 0xa7: fd_reply_a7(); break;
+        case 0xaf: fd_reply_af(); break;
+        case 0x34: fd_reply_34(); break;
+        default: break;             /* 0x03（硬件状态）已随死代码移除 */
         }
     }
     if (xferred_bytes >= FD_RX_FRAME_BYTES &&
@@ -875,8 +940,8 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
                     if (b[i] != 0) { imu_zero = false; break; }
                 }
                 if (imu_zero) {
-                    g_fd.ef_zero_imu++;
-                    memcpy((void *)g_fd.last_zero_imu_raw, b, FD_RX_FRAME_BYTES);
+                    g_fd.glitch.zero_imu++;
+                    memcpy((void *)g_fd.glitch.last_zero_imu_raw, b, FD_RX_FRAME_BYTES);
                 }
                 if (s_base_us != 0) {
                     const int32_t xsum = (int32_t)s_base.lx + s_base.ly + s_base.rx + s_base.ry;
@@ -889,8 +954,8 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
                         int32_t const d2 = (int32_t)f2 - s_base.rx, d3 = (int32_t)f3 - s_base.ry;
                         if (d0 < 256 && d0 > -256 && d1 < 256 && d1 > -256 &&
                             d2 < 256 && d2 > -256 && d3 < 256 && d3 > -256) {
-                            g_fd.ef_splice_suspect++;
-                            memcpy((void *)g_fd.last_splice_raw, b, FD_RX_FRAME_BYTES);
+                            g_fd.glitch.splice++;
+                            memcpy((void *)g_fd.glitch.last_splice_raw, b, FD_RX_FRAME_BYTES);
                         }
                     }
                 }
@@ -995,7 +1060,8 @@ static void fd_poll_ep(uint8_t dev_addr, uint8_t ep, uint8_t *buf, uint16_t len,
     *status_in_flight = true;
 }
 
-/* 依次发命令：4 条初始化握手 + 开 test mode */
+/* 依次发命令：4 条初始化握手 + 开 test mode；启动完成后 = 帧队列（写入类命令）
+ * + 引擎（acquire 声明 / 全局配置分块读 / 设备信息兜底 poll）。 */
 static void fd_send_cmds(void)
 {
     if (!s_ex.mounted) return;
@@ -1014,10 +1080,10 @@ static void fd_send_cmds(void)
         s_gcfg_stale = false;
         s_gcfg_pending = true;
     }
-    if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_pending &&
-         !s_rate_pending && !s_gcfg_pending && !s_sku_pending && !s_fp_pending &&
-         !s_meta_pending && !s_slot_pending && !s_save_pending && !s_reset_pending &&
-         !s_calib_pending && !s_status_set_pending && !s_field_pending && !s_name_pending &&
+    bool const queued = fd_cmdq_depth() > 0;
+    /* 有命令/读取在等（或仍在启动序列）→ 立即发送；否则按 cmd_next_ms 节奏兜底 poll。
+     * s_gcfg_pending 必须计入工作判定，否则自动读取会被 500ms/5s 节奏拖慢。 */
+    if ((!acquire_pending && !queued && !s_gcfg_pending &&
          !(s_gcfg_active && !s_gcfg_waiting)) ||
         s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
         if ((int32_t)(now_ms() - s_ex.cmd_next_ms) < 0) return;
@@ -1025,205 +1091,47 @@ static void fd_send_cmds(void)
     if (!usbh_edpt_claim(s_ex.daddr, s_ex.ep_out)) { g_fd.cmd_claim_fail++; return; }
 
     memset(s_ex.cmd_buf, 0, FD_CMD_BYTES);
+    uint8_t tag = TAG_NONE;
     if (acquire_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         /* SDL's unnumbered HID write omits its leading report selector 0x03. */
-        static const uint8_t acquire_cmd[] = { 0x5a, 0xa5, 0x1c, 23, 0,
-                                               'B', 'R', 'G' };
-        memcpy(s_ex.cmd_buf, acquire_cmd, sizeof acquire_cmd);
-        s_ex.cmd_buf[4] = acquire_value ? 1u : 0u;
-    } else if (s_sleep_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 睡眠写入：官方路径 = 0xA0 SetDeviceConfig，fieldId=32(0x20)。
-         * 帧：5A A5 A0 04 20 VV CS（VV=分钟数，0=永不） */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa0;
-        s_ex.cmd_buf[3] = 0x04;
-        s_ex.cmd_buf[4] = 0x20;
-        s_ex.cmd_buf[5] = s_sleep_minutes;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[6] = cs;
-        s_sleep_pending = false;
-    } else if (s_rate_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 报告率写入：官方路径 = 0xA0 fieldId=33(0x21)，载荷 u16LE Hz。
-         * 帧：5A A5 A0 05 21 LL HH CS */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa0;
-        s_ex.cmd_buf[3] = 0x05;
-        s_ex.cmd_buf[4] = 0x21;
-        s_ex.cmd_buf[5] = (uint8_t)(s_rate_hz & 0xffu);
-        s_ex.cmd_buf[6] = (uint8_t)(s_rate_hz >> 8);
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 6u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[7] = cs;
-        s_rate_pending = false;
-    } else if (s_field_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 通用 0xA0 字段写：len = 载荷长度 + 2（u8 → 0x04，u16LE → 0x05）。
-         * 帧：5A A5 A0 04 <fieldId> <v> CS 或 5A A5 A0 05 <fieldId> <lo> <hi> CS */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa0;
-        s_ex.cmd_buf[4] = s_field_id;
-        uint8_t end;
-        if (s_field_id == FD_FIELD_RATE) {
-            s_ex.cmd_buf[3] = 0x05;
-            s_ex.cmd_buf[5] = (uint8_t)(s_field_value & 0xffu);
-            s_ex.cmd_buf[6] = (uint8_t)(s_field_value >> 8);
-            end = 6;
+        flydigi_frame_acquire(s_ex.cmd_buf, acquire_value);
+    } else if (s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
+        if (s_ex.cmd_idx == 4u) {
+            /* Captured receiver startup sequence includes this status request
+             * between config-data and the test-mode command. */
+            static const uint8_t status_cmd[] = { 0x5a, 0xa5, 0x10, 0x02, 0x12 };
+            memcpy(s_ex.cmd_buf, status_cmd, sizeof status_cmd);
         } else {
-            s_ex.cmd_buf[3] = 0x04;
-            s_ex.cmd_buf[5] = (uint8_t)(s_field_value & 0xffu);
-            end = 5;
+            uint8_t const table_idx = s_ex.cmd_idx > 4u ? 4u : s_ex.cmd_idx;
+            flydigi_cmd_pack(&FD_CMDS[table_idx], s_ex.cmd_buf);
         }
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= end; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[end + 1] = cs;
-        s_field_pending = false;
-    } else if (s_name_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xA0 field 1：显示名文本（载荷 [01, text...]，NUL 不必填）。 */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa0;
-        s_ex.cmd_buf[3] = (uint8_t)(1u + s_name_len + 2u);
-        s_ex.cmd_buf[4] = 0x01;
-        for (unsigned i = 0; i < s_name_len; i++)
-            s_ex.cmd_buf[5 + i] = (uint8_t)s_name_text[i];
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 4u + s_name_len; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[5 + s_name_len] = cs;
-        s_name_pending = false;
-    } else if (s_sku_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0x0F SKU 名称查询：5A A5 0F 02 11 */
-        static const uint8_t sku_cmd[] = { 0x5a, 0xa5, 0x0f, 0x02, 0x11 };
-        memcpy(s_ex.cmd_buf, sku_cmd, sizeof sku_cmd);
-        s_sku_pending = false;
-    } else if (s_fp_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xA1 配置指纹查询：5A A5 A1 02 A3 */
-        static const uint8_t fp_cmd[] = { 0x5a, 0xa5, 0xa1, 0x02, 0xa3 };
-        memcpy(s_ex.cmd_buf, fp_cmd, sizeof fp_cmd);
-        s_fp_pending = false;
-        s_fp_awaiting_reply = true;
-    } else if (s_meta_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xA3 子操作 1：RAM 元数据（长度 + CRC32）。帧：5A A5 A3 04 01 RR CS */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa3;
-        s_ex.cmd_buf[3] = 0x04;
-        s_ex.cmd_buf[4] = 0x01;
-        s_ex.cmd_buf[5] = s_meta_ram;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[6] = cs;
-        s_meta_pending = false;
-    } else if (s_slot_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xA2 切换板载配置槽：5A A5 A2 03 SS CS */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa2;
-        s_ex.cmd_buf[3] = 0x03;
-        s_ex.cmd_buf[4] = s_slot_value;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 4u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[5] = cs;
-        s_slot_pending = false;
-        g_fd.slot_switches++;
-    } else if (s_save_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xA7 保存到板载（官方：payload [01, cfgId]）：5A A5 A7 04 01 SS CS */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa7;
-        s_ex.cmd_buf[3] = 0x04;
-        s_ex.cmd_buf[4] = 0x01;
-        s_ex.cmd_buf[5] = s_save_slot;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[6] = cs;
-        s_save_pending = false;
-    } else if (s_reset_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0xAF 重置配置段（探测）：5A A5 AF 03 II CS（0-3 用户槽 128 全局 129 出厂 255 全部） */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xaf;
-        s_ex.cmd_buf[3] = 0x03;
-        s_ex.cmd_buf[4] = s_reset_value;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 4u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[5] = cs;
-        s_reset_pending = false;
-    } else if (s_calib_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 摇杆校准（官方 joystickCalibrationPort）：32B 特殊帧，校验位在末字节。
-         * 开始 = 5A A5 34 04 00 81 03 01 … 结束 = …03 02。 */
-        static const uint8_t calib_head[] = { 0x5a, 0xa5, 0x34, 0x04, 0x00, 0x81, 0x03 };
-        memcpy(s_ex.cmd_buf, calib_head, sizeof calib_head);
-        s_ex.cmd_buf[7] = s_calib_start ? 0x01 : 0x02;
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 30u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[31] = cs;
-        s_calib_pending = false;
-        if (s_calib_start) g_fd.calib_starts++;
-        else g_fd.calib_finishes++;
-    } else if (s_status_set_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 0x11 SET_STATUS（探索）：载荷 [xinput,dinput,keyboard,mouse,thirdparty, 0×22]，
-         * 共 27B；255 = 保持不变；thirdparty 恒 255（acquire 依赖）。 */
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0x11;
-        s_ex.cmd_buf[3] = 0x1d;             /* len = 27 + 2 */
-        s_ex.cmd_buf[4] = s_status_set_value[0];
-        s_ex.cmd_buf[5] = s_status_set_value[1];
-        s_ex.cmd_buf[6] = 0xff;             /* keyboardStatus 不动 */
-        s_ex.cmd_buf[7] = s_status_set_value[2];
-        s_ex.cmd_buf[8] = 0xff;             /* allowThirdparty 不动 */
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 30u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[31] = cs;
-        s_status_set_pending = false;
-        g_fd.status_set_sent++;
-    } else if ((s_gcfg_pending || (s_gcfg_active && !s_gcfg_waiting)) &&
-               s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 全局配置读取：0xA3 READ_CHUNK（ramId=1，16B/块），应答驱动连读。 */
+    } else if (fd_cmdq_pop(s_ex.cmd_buf, &tag)) {
+        /* 队列帧已就位；提交前按 tag 施加副作用，与旧分支“先置副作用再提交”一致。 */
+        switch (tag) {
+        case TAG_FP_QUERY:    s_fp_awaiting_reply = true; break;
+        case TAG_SLOT_SWITCH: g_fd.fp.switches++; break;
+        case TAG_CALIB_START: g_fd.ops.calib_starts++; break;
+        case TAG_CALIB_FINISH: g_fd.ops.calib_finishes++; break;
+        case TAG_STATUS_SET:  g_fd.ops.status_set_sent++; break;
+        default: break;
+        }
+    } else if (s_gcfg_pending || (s_gcfg_active && !s_gcfg_waiting)) {
+        /* 全局配置读取：0xA3 READ_CHUNK（ramId=1，16B/块），应答驱动连读；
+         * pending 在真正发块时转 active 并重置游标（等价旧分支内转换，
+         * 未转 active 前不启动 2s 超时计时）。 */
         if (s_gcfg_pending) {
             s_gcfg_pending = false;
             s_gcfg_active = true;
             s_gcfg_chunk = 0;
             memset(s_gcfg_buf, 0, sizeof s_gcfg_buf);
         }
-        s_ex.cmd_buf[0] = 0x5a;
-        s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0xa3;
-        s_ex.cmd_buf[3] = 0x06;             /* len = 2 + 4 载荷 */
-        s_ex.cmd_buf[4] = 0x00;             /* 子操作 READ_CHUNK */
-        s_ex.cmd_buf[5] = 0x01;             /* ramId 1 = 全局配置 */
-        s_ex.cmd_buf[6] = s_gcfg_chunk;
-        s_ex.cmd_buf[7] = 0x10;             /* chunkSize 16 */
-        uint8_t cs = 0;
-        for (unsigned i = 2; i <= 7u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
-        s_ex.cmd_buf[8] = cs;
+        flydigi_frame_ram_read_chunk(s_ex.cmd_buf, 1, s_gcfg_chunk);
         s_gcfg_waiting = true;
         s_gcfg_last_ms = now_ms();
-    } else if (s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        if (s_hwinfo_pending) {
-            /* 按需读硬件状态（cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
-            static const uint8_t hw_cmd[] = { 0x5a, 0xa5, 0x03, 0x02, 0x05 };
-            memcpy(s_ex.cmd_buf, hw_cmd, sizeof hw_cmd);
-            s_hwinfo_pending = false;
-        } else {
-            /* Keep the battery fresh without turning the device-info request into
-             * a 2 Hz latency spike.  The receiver stalls its input endpoints for
-             * about 18 ms while handling this command, so after the first valid
-             * reply it is enough to query every few seconds. */
-            static const uint8_t poll_cmd[] = { 0x5a, 0xa5, 0x01, 0x02, 0x03 };
-            memcpy(s_ex.cmd_buf, poll_cmd, sizeof poll_cmd);
-        }
-    } else if (s_ex.cmd_idx == 4u) {
-        /* Captured receiver startup sequence includes this status request
-         * between config-data and the test-mode command. */
-        static const uint8_t status_cmd[] = { 0x5a, 0xa5, 0x10, 0x02, 0x12 };
-        memcpy(s_ex.cmd_buf, status_cmd, sizeof status_cmd);
     } else {
-        uint8_t const table_idx = s_ex.cmd_idx > 4u ? 4u : s_ex.cmd_idx;
-        flydigi_cmd_pack(&FD_CMDS[table_idx], s_ex.cmd_buf);
+        /* 兜底 poll：设备信息查询（5a a5 01 02 03，同抓包 poll_cmd），
+         * 保持电池/连接信息新鲜（原按需 cmd 03 读取已随死代码移除）。 */
+        flydigi_frame_query(s_ex.cmd_buf, 0x01);
     }
     if (!usbh_edpt_xfer(s_ex.daddr, s_ex.ep_out, s_ex.cmd_buf, FD_CMD_BYTES)) {
         usbh_edpt_release(s_ex.daddr, s_ex.ep_out);
@@ -1247,15 +1155,10 @@ static void fd_send_cmds(void)
         bool const battery_valid = g_fd.battery_valid;
         s_ex.cmd_next_ms = now_ms() +
             (battery_valid ? FD_DEVICE_INFO_POLL_MS : FD_DEVICE_INFO_RETRY_MS);
-        /* 开机完成后自动取一次硬件状态（只做一次；失败可用控制台 's' 重试） */
-        if (!s_hwinfo_auto_done) {
-            s_hwinfo_auto_done = true;
-            s_hwinfo_pending = true;
-        }
         /* 开机自动读一次全局配置（填充 [CFG]；睡眠非 0 时会在读取完成后自愈） */
         if (!s_gcfg_auto_done) {
             s_gcfg_auto_done = true;
-            s_gcfg_pending = true;
+            flydigi_host_request_global_config();
         }
         /* SDL 式接管声明（0x1C）：接收器据此切到高帧率流（EF 实测 97→716 Hz）。
          * 每次挂载/断流恢复只声明一次；接收器会记录占用者（此处为 "BRG"）。 */
@@ -1390,61 +1293,72 @@ void flydigi_host_resend_cmds(void)
     critical_section_exit(&s_state_lock);
 }
 
-void flydigi_host_request_hw_status(void)
-{
-    s_hwinfo_pending = true;
-}
-
+/* 睡眠定时器分钟数（0xA0 field 32）：建帧入队；0 = 永不。 */
 void flydigi_host_request_sleep_minutes(uint8_t minutes)
 {
-    s_sleep_minutes = minutes;
-    s_sleep_pending = true;
+    flydigi_host_request_field(FD_FIELD_SLEEP, minutes);
 }
 
+/* 报告率 Hz（0xA0 field 33，u16LE）：建帧入队。 */
 void flydigi_host_request_report_rate_hz(uint16_t hz)
 {
-    s_rate_hz = hz;
-    s_rate_pending = true;
+    flydigi_host_request_field(FD_FIELD_RATE, hz);
 }
 
 void flydigi_host_request_sku(void)
 {
-    s_sku_pending = true;
+    /* 0x0F SKU 名称查询：5A A5 0F 02 11 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_query(frame, 0x0f);
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_fingerprint(void)
 {
-    s_fp_pending = true;
+    /* 0xA1 配置指纹查询：5A A5 A1 02 A3 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_query(frame, 0xa1);
+    fd_cmdq_push(frame, TAG_FP_QUERY);
 }
 
 void flydigi_host_request_ram_meta(uint8_t ram_id)
 {
-    s_meta_ram = ram_id;
-    s_meta_pending = true;
+    /* 0xA3 子操作 1：RAM 元数据（长度 + CRC32）。 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_ram_meta(frame, ram_id);
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_switch_slot(uint8_t slot)
 {
-    s_slot_value = (uint8_t)(slot & 0x03u);
-    s_slot_pending = true;
+    /* 0xA2 切换板载配置槽。 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_slot_switch(frame, (uint8_t)(slot & 0x03u));
+    fd_cmdq_push(frame, TAG_SLOT_SWITCH);
 }
 
 void flydigi_host_request_save(uint8_t slot)
 {
-    s_save_slot = (uint8_t)(slot & 0x03u);
-    s_save_pending = true;
+    /* 0xA7 保存到板载（payload [01, cfgId]）。 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_save(frame, (uint8_t)(slot & 0x03u));
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_reset(uint8_t cfg_id)
 {
-    s_reset_value = cfg_id;
-    s_reset_pending = true;
+    /* 0xAF 重置配置段：0-3 用户槽 / 128 全局 / 129 出厂 / 255 全部。 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_reset(frame, cfg_id);
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_calibration(bool start)
 {
-    s_calib_start = start;
-    s_calib_pending = true;
+    /* 摇杆校准（32B 特殊帧）；开始/结束用 tag 区分计数。 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_calib(frame, start);
+    fd_cmdq_push(frame, start ? TAG_CALIB_START : TAG_CALIB_FINISH);
 }
 
 bool flydigi_host_field_writable(uint8_t field_id)
@@ -1467,36 +1381,38 @@ bool flydigi_host_field_writable(uint8_t field_id)
 void flydigi_host_request_field(uint8_t field_id, uint16_t value)
 {
     if (!flydigi_host_field_writable(field_id)) return;
-    s_field_id = field_id;
-    s_field_value = value;
-    s_field_pending = true;
+    uint8_t frame[FD_CMD_BYTES];
+    if (field_id == FD_FIELD_RATE)
+        flydigi_frame_field_u16le(frame, field_id, value);   /* 0xA0 载荷 u16LE */
+    else
+        flydigi_frame_field_u8(frame, field_id, (uint8_t)value);   /* 0xA0 载荷 u8 */
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_name(const char *text)
 {
     if (text == NULL) return;
     unsigned n = 0;
-    for (; n < sizeof s_name_text - 1u && text[n] != '\0'; n++)
-        s_name_text[n] = text[n];
-    s_name_text[n] = '\0';
-    s_name_len = (uint8_t)n;
-    s_name_pending = true;
+    while (n < 16u && text[n] != '\0') n++;      /* 长度上限 16 不变 */
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_field_text(frame, FD_FIELD_NAME, text, n);
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_status_set(uint8_t xinput, uint8_t dinput, uint8_t mouse)
 {
-    s_status_set_value[0] = xinput;
-    s_status_set_value[1] = dinput;
-    s_status_set_value[2] = mouse;
-    s_status_set_pending = true;
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_status_set(frame, xinput, dinput, mouse);
+    fd_cmdq_push(frame, TAG_STATUS_SET);
 }
 
-/* 恢复 allowThirdparty=1（0xAF 重置实验的保底路径；acquire 依赖此位）。 */
+/* 恢复 allowThirdparty=1（0xAF 重置实验的保底路径；acquire 依赖此位）。
+ * 37 不在白名单，直接建帧（等价旧 field 分支：5A A5 A0 04 25 01 CS）。 */
 void flydigi_host_request_thirdparty_restore(void)
 {
-    s_field_id = FD_FIELD_THIRDPARTY;
-    s_field_value = 1;
-    s_field_pending = true;
+    uint8_t frame[FD_CMD_BYTES];
+    flydigi_frame_field_u8(frame, FD_FIELD_THIRDPARTY, 1);
+    fd_cmdq_push(frame, TAG_NONE);
 }
 
 void flydigi_host_request_global_config(void)

@@ -72,15 +72,15 @@ if [ "$PY_REP" = "$C_REP" ]; then echo "场景报文逐字节一致 ✔ ($C_REP)
 echo
 echo "=== 7) 输入侧解析 + 命令表 + 映射（用真机抓到的扩展帧）==="
 clang -std=c11 -Wall -Wextra -Werror -O2 -o build/flydigi_test \
-      test/flydigi_test.c src/flydigi_rx.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
+      test/flydigi_test.c src/flydigi_rx.c src/flydigi_cmd.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
 ./build/flydigi_test > build/flydigi.txt || { tail -12 build/flydigi.txt; exit 1; }
 grep -E '加速度 Z|回报 |M1–M4\+A|PASS:|FAIL:' build/flydigi.txt
 clang -std=c11 -Wall -Wextra -Werror -O2 -DGENERIC_GAMEPAD -o build/flydigi_generic_test \
-      test/flydigi_test.c src/flydigi_rx.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
+      test/flydigi_test.c src/flydigi_rx.c src/flydigi_cmd.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
 ./build/flydigi_generic_test > build/flydigi_generic.txt || { tail -12 build/flydigi_generic.txt; exit 1; }
 grep -E '回报 |M1–M4\+A|PASS:|FAIL:' build/flydigi_generic.txt
 clang -std=c11 -Wall -Wextra -Werror -O2 -DGENERIC_GAMEPAD -DCORSAIR_APPLE_IDENTITY -o build/flydigi_scuf_test \
-      test/flydigi_test.c src/flydigi_rx.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
+      test/flydigi_test.c src/flydigi_rx.c src/flydigi_cmd.c src/bridge_map.c src/bridge_config.c src/report_pack.c -Isrc
 ./build/flydigi_scuf_test > build/flydigi_scuf.txt || { tail -12 build/flydigi_scuf.txt; exit 1; }
 grep -E 'SCUF-order|PASS:|FAIL:' build/flydigi_scuf.txt
 

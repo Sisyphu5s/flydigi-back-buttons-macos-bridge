@@ -147,6 +147,7 @@ add_executable(flydigi_bridge
     app_driver.c
     usb_descriptors.c
     ${FW_SRC}/flydigi_rx.c
+    ${FW_SRC}/flydigi_cmd.c
     ${FW_SRC}/bridge_map.c
     ${FW_SRC}/bridge_config.c
     ${FW_SRC}/bridge_timing.c

@@ -354,8 +354,8 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
         cfg_response_status(0);
         /* 布局：[2]=model [3]=conn [4]=battery [5]=chips(lo=main hi=recv)
          * [6]=gyro_type [7]=features [8..21]=7×fw u16BE
-         * [22..41]=SKU 20B [42]=sku_valid [43]=ex_valid */
-        const flydigi_dev_info_t *d = &st.dev_ex;
+         * [22..41]=SKU 20B [42]=sku.valid [43]=dev_ext.valid */
+        const flydigi_dev_info_t *d = &st.dev_ext.ex;
         s_cfg_response[2] = st.dev_model;
         s_cfg_response[3] = st.dev_connection;
         s_cfg_response[4] = st.battery_valid ? st.battery_percent : 0xffu;
@@ -376,9 +376,9 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
         s_cfg_response[19] = (uint8_t)d->fw_adc;
         s_cfg_response[20] = (uint8_t)(d->fw_sstar >> 8);
         s_cfg_response[21] = (uint8_t)d->fw_sstar;
-        if (st.sku_valid) memcpy(&s_cfg_response[22], st.sku_name, 20);
-        s_cfg_response[42] = st.sku_valid ? 1u : 0u;
-        s_cfg_response[43] = st.dev_ex_valid ? 1u : 0u;
+        if (st.sku.valid) memcpy(&s_cfg_response[22], st.sku.name, 20);
+        s_cfg_response[42] = st.sku.valid ? 1u : 0u;
+        s_cfg_response[43] = st.dev_ext.valid ? 1u : 0u;
     } else if (cmd == CFG_CMD_SET_FIELD && bufsize >= 3u) {
         uint8_t const field = buffer[1];
         uint16_t const value = (uint16_t)(buffer[2] | ((uint16_t)buffer[3] << 8));
@@ -405,16 +405,16 @@ void bridge_config_set_report(uint8_t report_id, uint8_t report_type,
         cfg_response_status(0);
         /* 布局：[2]=valid [3]=active_slot [4..11]=槽 CRC16×4 LE
          * [12..13]=全局 CRC16 LE [14..17]=push 计数 u32 */
-        s_cfg_response[2] = st.fp_valid ? 1u : 0u;
-        s_cfg_response[3] = st.fp_active_slot;
+        s_cfg_response[2] = st.fp.valid ? 1u : 0u;
+        s_cfg_response[3] = st.fp.active_slot;
         for (unsigned i = 0; i < 4u; i++) {
-            s_cfg_response[4 + 2 * i] = (uint8_t)(st.fp_slot_crc[i] & 0xffu);
-            s_cfg_response[5 + 2 * i] = (uint8_t)(st.fp_slot_crc[i] >> 8);
+            s_cfg_response[4 + 2 * i] = (uint8_t)(st.fp.slot_crc[i] & 0xffu);
+            s_cfg_response[5 + 2 * i] = (uint8_t)(st.fp.slot_crc[i] >> 8);
         }
-        s_cfg_response[12] = (uint8_t)(st.fp_global_crc & 0xffu);
-        s_cfg_response[13] = (uint8_t)(st.fp_global_crc >> 8);
+        s_cfg_response[12] = (uint8_t)(st.fp.global_crc & 0xffu);
+        s_cfg_response[13] = (uint8_t)(st.fp.global_crc >> 8);
         for (unsigned i = 0; i < 4u; i++)
-            s_cfg_response[14 + i] = (uint8_t)(st.fp_push_count >> (8 * i));
+            s_cfg_response[14 + i] = (uint8_t)(st.fp.push_count >> (8 * i));
     } else if (cmd == CFG_CMD_SET_NAME && bufsize >= 2u) {
         char text[17];
         unsigned n = 0;
@@ -679,17 +679,14 @@ static void log_status(void)
             (unsigned long)s_usb_rate,
             (unsigned long)s_usb_dt_min_us, (unsigned long)s_usb_dt_max_us,
             (unsigned long)s_usb_refill_late);
-    /* 设备信息（cmd 01）+ 硬件状态（cmd 03）：固件/连接/睡眠/报告率 */
-    brg_log("[DEV] model=%u conn=%u fw=%u.%u.%u.%u sleep_min=%u rate=%u prec=%u sens=%u hwn=%lu\n",
+    /* 设备信息（cmd 01）：型号/连接/主固件版本 */
+    brg_log("[DEV] model=%u conn=%u fw=%u.%u.%u.%u\n",
             st.dev_model, st.dev_connection,
             (st.dev_fw_version >> 12) & 0xF, (st.dev_fw_version >> 8) & 0xF,
-            (st.dev_fw_version >> 4) & 0xF, st.dev_fw_version & 0xF,
-            st.hw_sleep_minutes, st.hw_report_rate,
-            st.hw_stick_precision, st.hw_stick_sensitivity,
-            (unsigned long)st.hw_status_replies);
+            (st.dev_fw_version >> 4) & 0xF, st.dev_fw_version & 0xF);
     /* 全量设备信息（0x01 二段）：7 个固件版本 + 芯片 + 陀螺仪 + 能力位 + SKU。 */
-    if (st.dev_ex_valid) {
-        const flydigi_dev_info_t *d = &st.dev_ex;
+    if (st.dev_ext.valid) {
+        const flydigi_dev_info_t *d = &st.dev_ext.ex;
         brg_log("[DEV+] fwm=%04x fwr=%04x fwsi=%04x fwt=%04x fws=%04x fwa=%04x fwsst=%04x chip=%u/%u gyro=%u feat=%02x%s%s%s%s%s%s%s%s sku=%s\n",
                 d->fw_main, d->fw_recv, d->fw_si, d->fw_trigger, d->fw_screen,
                 d->fw_adc, d->fw_sstar, d->chip_main, d->chip_recv, d->gyro_type,
@@ -702,7 +699,7 @@ static void log_status(void)
                 (d->features & FD_FEATURE_TRIGGER_VIBRATE) ? " TRG-VIB" : "",
                 (d->features & FD_FEATURE_AUDIO) ? " AUD" : "",
                 (d->features & FD_FEATURE_HAPTIC) ? " HAP" : "",
-                st.sku_valid ? st.sku_name : "?");
+                st.sku.valid ? st.sku.name : "?");
     } else {
         brg_log("[DEV+] (未收到全量设备信息)\n");
     }
@@ -714,20 +711,21 @@ static void log_status(void)
             st.gcfg.local_map ? 1u : 0u, st.gcfg.xinput_home ? 1u : 0u,
             st.gcfg.name,
             (unsigned long)st.gcfg_reads, (unsigned long)st.gcfg_errors);
-    /* 配置指纹（0xA1/A2）+ RAM 元数据（0xA3 子 1）+ 写入计数。 */
-    brg_log("[FP] slot=%u crc=%04x/%04x/%04x/%04x g=%04x pushes=%lu meta=%02x r%u len=%u crc32=%08lx sw=%lu sv=%lu rs=%lu cal=%lu/%lu/%lu\n",
-            st.fp_active_slot, st.fp_slot_crc[0], st.fp_slot_crc[1],
-            st.fp_slot_crc[2], st.fp_slot_crc[3], st.fp_global_crc,
-            (unsigned long)st.fp_push_count, st.meta_status, st.meta_ram,
-            st.meta_len, (unsigned long)st.meta_crc32,
-            (unsigned long)st.slot_switches, (unsigned long)st.save_replies,
-            (unsigned long)st.reset_replies, (unsigned long)st.calib_starts,
-            (unsigned long)st.calib_finishes, (unsigned long)st.calib_replies);
+    /* 配置指纹（0xA1/A2）+ RAM 元数据（0xA3 子 1）+ 写入计数 + 命令队列。 */
+    brg_log("[FP] slot=%u crc=%04x/%04x/%04x/%04x g=%04x pushes=%lu meta=%02x r%u len=%u crc32=%08lx sw=%lu sv=%lu rs=%lu cal=%lu/%lu/%lu q=%u/%lu\n",
+            st.fp.active_slot, st.fp.slot_crc[0], st.fp.slot_crc[1],
+            st.fp.slot_crc[2], st.fp.slot_crc[3], st.fp.global_crc,
+            (unsigned long)st.fp.push_count, st.meta.status, st.meta.ram,
+            st.meta.len, (unsigned long)st.meta.crc32,
+            (unsigned long)st.fp.switches, (unsigned long)st.ops.save_replies,
+            (unsigned long)st.ops.reset_replies, (unsigned long)st.ops.calib_starts,
+            (unsigned long)st.ops.calib_finishes, (unsigned long)st.ops.calib_replies,
+            (unsigned)flydigi_host_cmdq_depth(), (unsigned long)st.q_drops);
     /* 拼接帧嫌疑（接收器偶发把 XInput 载荷拼进 EF 帧）。 */
     brg_log("[GLTCH] zero_imu=%lu splice=%lu sp=%02x%02x%02x%02x\n",
-            (unsigned long)st.ef_zero_imu, (unsigned long)st.ef_splice_suspect,
-            st.last_splice_raw[13], st.last_splice_raw[14],
-            st.last_splice_raw[15], st.last_splice_raw[16]);
+            (unsigned long)st.glitch.zero_imu, (unsigned long)st.glitch.splice,
+            st.glitch.last_splice_raw[13], st.glitch.last_splice_raw[14],
+            st.glitch.last_splice_raw[15], st.glitch.last_splice_raw[16]);
     /* 官方字段写（0xA0）应答：'S'=field32 睡眠；1/2/4/8=field33 回报率 */
     brg_log("[A0] replies=%lu status=%u field=%u\n",
             (unsigned long)st.a0_replies, st.a0_last_status, st.a0_last_field);
@@ -936,7 +934,7 @@ static void log_banner(void)
     brg_log("identity: VID=%04x PID=%04x bcdDevice=%04x  HID report=%u B, %u bytes\n",
          BRIDGE_USB_VID, BRIDGE_USB_PID, BRIDGE_USB_BCD,
          (unsigned)sizeof(BRIDGE_GAMEPAD_DESC), VADER2PRO_REPORT_BYTES);
-    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend s=hw-status S=sleep-never 1/2/4/8=rate g=gcfg R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
+    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend S=sleep-never 1/2/4/8=rate g=gcfg R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
 }
 
 static void log_raw(void)
@@ -1060,7 +1058,7 @@ static unsigned st_fp_slot_for_save(void)
 {
     fd_host_status_t st;
     flydigi_host_get(NULL, &st, NULL);
-    return st.fp_valid ? (unsigned)st.fp_active_slot + 1u : 0u;
+    return st.fp.valid ? (unsigned)st.fp.active_slot + 1u : 0u;
 }
 
 static void console_task(void)
@@ -1110,7 +1108,6 @@ static void console_task(void)
         switch ((char)c) {
         case 'i': log_status(); break;
         case 'r': flydigi_host_resend_cmds(); brg_log("[CMD] 命令序列已重排\n"); break;
-        case 's': flydigi_host_request_hw_status(); brg_log("[CMD] hw status queued\n"); break;
         case 'S': flydigi_host_request_sleep_minutes(0); brg_log("[CMD] sleep=never queued\n"); break;
         case '1': flydigi_host_request_report_rate_hz(1000); brg_log("[CMD] report rate 1000 Hz queued\n"); break;
         case '2': flydigi_host_request_report_rate_hz(500); brg_log("[CMD] report rate 500 Hz queued\n"); break;

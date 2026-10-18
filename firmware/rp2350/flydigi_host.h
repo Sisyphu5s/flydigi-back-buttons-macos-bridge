@@ -51,6 +51,17 @@ typedef struct {
     uint16_t raw_buttons;
 } fd_input_event_t;
 
+/* ---- 2026-10-18 官方扩展能力：按域分组（旧字段冻结不搬迁） ---- */
+typedef struct { bool valid; flydigi_dev_info_t ex; uint32_t replies; } fd_dev_ext_t;
+typedef struct { bool valid; uint8_t value; char name[21]; uint32_t replies; } fd_sku_t;
+typedef struct { bool valid; uint8_t active_slot; uint16_t slot_crc[4]; uint16_t global_crc;
+                 uint32_t replies, push_count, slot_replies, switches; } fd_fp_t;
+typedef struct { uint32_t replies; uint8_t status, ram, slot; uint16_t len; uint32_t crc32; } fd_meta_t;
+typedef struct { uint32_t zero_imu, splice; uint8_t last_splice_raw[FD_RX_FRAME_BYTES];
+                 uint8_t last_zero_imu_raw[FD_RX_FRAME_BYTES]; } fd_glitch_t;
+typedef struct { uint32_t calib_starts, calib_finishes, calib_replies, save_replies,
+                 reset_replies, status_set_sent; } fd_op_counters_t;
+
 typedef struct {
     /* 连接与计数（只读，供日志/控制台） */
     bool     receiver_mounted;      /* 接收器已被 host 栈配置完成 */
@@ -88,14 +99,10 @@ typedef struct {
     uint8_t  battery_percent, battery_state;
     uint32_t battery_updates, rumble_sent, rumble_fail;
 
-    /* 设备信息（cmd 01）与硬件状态（cmd 03，按需读取）。 */
+    /* 设备信息（cmd 01）：型号/连接/主固件版本（由全量 0x01 解析同步填充）。 */
     bool     dev_info_valid;
     uint8_t  dev_model, dev_connection;      /* 130 = Vader 5 Pro；1 有线 / 2 无线 */
     uint16_t dev_fw_version;                 /* BCD 半字节：0x7140 → 7.1.4.0 */
-    bool     hw_status_valid;
-    uint8_t  hw_sleep_minutes, hw_report_rate;
-    uint8_t  hw_stick_precision, hw_stick_sensitivity;
-    uint32_t hw_status_replies;
 
     /* 全局配置（0xA3 读 RAM1 → slice(2,82) 的 80B blob，控制台 'g'）。 */
     bool     gcfg_valid;
@@ -135,38 +142,14 @@ typedef struct {
     uint8_t  hid_proto_last_itf;
     uint8_t  hid_proto_last_result;
 
-    /* ---- 官方扩展能力（2026-10-18 二次核对落地） ---- */
-    /* 设备信息全量（0x01）。 */
-    bool     dev_ex_valid;
-    flydigi_dev_info_t dev_ex;
-    uint32_t dev_ex_replies;
-    /* SKU 名称（0x0F）。 */
-    bool     sku_valid;
-    uint8_t  sku_value;
-    char     sku_name[21];
-    uint32_t sku_replies;
-    /* 配置指纹（0xA1 查询 + 推送 / 0xA2 切槽应答）。 */
-    bool     fp_valid;
-    uint8_t  fp_active_slot;
-    uint16_t fp_slot_crc[4];
-    uint16_t fp_global_crc;
-    uint32_t fp_replies, fp_push_count;
-    uint32_t slot_replies, slot_switches;
-    /* RAM 元数据（0xA3 子操作 1）。 */
-    uint32_t meta_replies;
-    uint8_t  meta_status, meta_ram, meta_slot;
-    uint16_t meta_len;
-    uint32_t meta_crc32;
-    /* 校准 / 保存 / 重置（0x34 / 0xA7 / 0xAF）。 */
-    uint32_t calib_starts, calib_finishes, calib_replies;
-    uint32_t save_replies, reset_replies;
-    /* 0x11 SET_STATUS（探索）。 */
-    uint32_t status_set_sent;
-    /* 拼接帧嫌疑检测（EF 帧 [13..20] ≈ 最近 XInput 摇杆值）。 */
-    uint32_t ef_splice_suspect;
-    uint8_t  last_splice_raw[FD_RX_FRAME_BYTES];
-    uint32_t ef_zero_imu;
-    uint8_t  last_zero_imu_raw[FD_RX_FRAME_BYTES];
+    /* ---- 官方扩展能力（2026-10-18 二次核对落地）：按域分组 ---- */
+    fd_dev_ext_t dev_ext;                    /* 全量设备信息（0x01 二段） */
+    fd_sku_t     sku;                        /* SKU 名称（0x0F） */
+    fd_fp_t      fp;                         /* 配置指纹（0xA1 查询+推送 / 0xA2 切槽应答） */
+    fd_meta_t    meta;                       /* RAM 元数据（0xA3 子操作 1） */
+    fd_glitch_t  glitch;                     /* 拼接帧嫌疑检测（EF [13..20] ≈ 最近 XInput 摇杆） */
+    fd_op_counters_t ops;                    /* 校准/保存/重置/状态位写入计数 */
+    uint32_t q_drops;                        /* 命令队列满导致的丢弃数（写入类命令） */
 } fd_host_status_t;
 
 extern volatile fd_host_status_t g_fd;
@@ -192,8 +175,8 @@ size_t flydigi_host_get_events(fd_input_event_t *out, size_t capacity);
 /* 重排命令序列（控制台 'r'）：从头再发一遍握手、状态查询和 test mode */
 void flydigi_host_resend_cmds(void);
 
-/* 请求一次硬件状态（控制台 's'，cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
-void flydigi_host_request_hw_status(void);
+/* 当前命令队列深度（诊断日志用；核心间安全快照） */
+uint32_t flydigi_host_cmdq_depth(void);
 
 /* 写睡眠定时器分钟数（控制台 'S' = 0 永不；0xA0 field 32） */
 void flydigi_host_request_sleep_minutes(uint8_t minutes);

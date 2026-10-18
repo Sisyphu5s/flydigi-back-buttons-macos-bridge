@@ -71,11 +71,20 @@ bool flydigi_rx_parse(const uint8_t *buf, size_t len, flydigi_rx_state_t *out);
 bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
                                uint8_t *percent, uint8_t *power_state);
 
-/* Decode a device-info reply (cmd 01) beyond the battery nibble: model
- * (130 = Vader 5 Pro), connection (1 wired / 2 wireless) and the main firmware
- * version as BCD nibbles (e.g. 0x7140 → "7.1.4.0"). */
-bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
-                            uint8_t *model, uint8_t *connection, uint16_t *fw_bcd);
+/* 统一应答视图：应答帧与命令帧同构 5a a5 <cmd> <len> <payload…> CS。
+ * p 指向帧 [3] 起（pkgCount/pkgIndex 或子操作/状态…），d 指向帧 [5] 起
+ * （数据载荷；与官方 payload 索引一致）。 */
+typedef struct {
+    uint8_t cmd;        /* 帧 [2] */
+    const uint8_t *p;   /* 帧 [3] 起（pkgCount/pkgIndex 或子操作/状态…） */
+    size_t pn;          /* min(len,32)-3 */
+    const uint8_t *d;   /* 帧 [5] 起（数据载荷；官方 payload 索引与此一致） */
+    size_t dn;          /* min(len,32)-5 */
+} flydigi_reply_view_t;
+
+/* 校验魔数 5a a5 + 校验和（=1+Σ[0..30]，等价 Σ[2..30]）+ buf[2]==cmd；
+ * 通过则填充 view（p/d 指向 buf 内部，buf 需保持存活）返回 true。 */
+bool flydigi_reply_view(const uint8_t *buf, size_t len, uint8_t cmd, flydigi_reply_view_t *view);
 
 /* 设备信息全量（0x01 应答，官方 Un() 同布局；版本为 u16 大端 BCD，0x7226 → 7.2.2.6）。 */
 typedef struct {
@@ -110,12 +119,6 @@ bool flydigi_rx_fingerprint(const uint8_t *buf, size_t len, uint8_t *active_slot
 /* RAM 元数据（0xA3 子操作 1）：状态 + ramId + 槽 + 长度 + CRC32。 */
 bool flydigi_rx_ram_meta(const uint8_t *buf, size_t len, uint8_t *status, uint8_t *ram_id,
                          uint8_t *slot, uint16_t *data_len, uint32_t *crc32);
-
-/* Decode a hardware-status reply (cmd 03): sleep minutes (0 = never), report
- * rate field, stick precision and stick sensitivity (raw device values). */
-bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
-                          uint8_t *report_rate, uint8_t *precision,
-                          uint8_t *sensitivity);
 
 /* 全局配置（官方 0xA3 读 RAM1 后取偏移 2..82 的 80 字节 blob）字段解码。 */
 typedef struct {

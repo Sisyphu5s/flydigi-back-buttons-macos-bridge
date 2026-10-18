@@ -71,30 +71,24 @@ bool flydigi_rx_battery_status(const uint8_t *buf, size_t len,
     return true;
 }
 
-bool flydigi_rx_device_info(const uint8_t *buf, size_t len,
-                            uint8_t *model, uint8_t *connection, uint16_t *fw_bcd)
+/* 统一应答校验 + 视图切分：魔数 + 校验和（1+Σ[0..30] ≡ Σ[2..30]）+ cmd。
+ * p=[3] 起、d=[5] 起；pn/dn 按 32 字节缓冲截断。 */
+bool flydigi_reply_view(const uint8_t *buf, size_t len, uint8_t cmd, flydigi_reply_view_t *view)
 {
-    if (buf == NULL || len < FD_RX_FRAME_BYTES || model == NULL ||
-        connection == NULL || fw_bcd == NULL) return false;
-    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x01) return false;
+    if (buf == NULL || view == NULL || len < FD_RX_FRAME_BYTES) return false;
+    if (buf[0] != FD_RX_MAGIC0 || buf[1] != FD_RX_MAGIC1 || buf[2] != cmd) return false;
 
     uint8_t checksum = 1;
     for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
     if (checksum != buf[FD_RX_FRAME_BYTES - 1]) return false;
 
-    *model = buf[5];
-    *connection = buf[6];
-    *fw_bcd = (uint16_t)((uint16_t)buf[15] << 8 | buf[16]);
+    size_t const n = len < FD_RX_FRAME_BYTES ? len : FD_RX_FRAME_BYTES;
+    view->cmd = cmd;
+    view->p = buf + 3;
+    view->pn = n - 3;
+    view->d = buf + 5;
+    view->dn = n - 5;
     return true;
-}
-
-/* 应答帧公共校验：魔数由调用方检查，校验和 = 1 + Σ[0..30]（等价于 Σ[2..30]）。 */
-static bool fd_reply_ok(const uint8_t *buf, size_t len)
-{
-    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
-    uint8_t checksum = 1;
-    for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
-    return checksum == buf[FD_RX_FRAME_BYTES - 1];
 }
 
 static uint16_t rd16be(const uint8_t *p)
@@ -104,40 +98,38 @@ static uint16_t rd16be(const uint8_t *p)
 
 bool flydigi_rx_device_info_ex(const uint8_t *buf, size_t len, flydigi_dev_info_t *out)
 {
-    if (buf == NULL || out == NULL || len < FD_RX_FRAME_BYTES) return false;
-    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x01) return false;
-    if (!fd_reply_ok(buf, len)) return false;
+    flydigi_reply_view_t v;
+    if (out == NULL || !flydigi_reply_view(buf, len, 0x01, &v)) return false;
 
-    out->model = buf[5];
-    out->connection = buf[6];
-    out->mac_le = (uint32_t)buf[7] | ((uint32_t)buf[8] << 8) |
-                  ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 24);
-    out->battery_byte = buf[11];
-    out->chip_main = buf[12] & 0x0fu;
-    out->chip_recv = (buf[12] >> 4) & 0x0fu;
-    out->gyro_type = buf[13] & 0x0fu;
-    out->fw_main = rd16be(buf + 15);
-    out->fw_recv = rd16be(buf + 17);
-    out->fw_si = rd16be(buf + 19);
-    out->fw_trigger = rd16be(buf + 21);
-    out->fw_screen = rd16be(buf + 23);
-    out->fw_adc = rd16be(buf + 25);
-    out->fw_sstar = rd16be(buf + 27);
-    out->features = buf[29];
+    out->model = v.d[0];
+    out->connection = v.d[1];
+    out->mac_le = (uint32_t)v.d[2] | ((uint32_t)v.d[3] << 8) |
+                  ((uint32_t)v.d[4] << 16) | ((uint32_t)v.d[5] << 24);
+    out->battery_byte = v.d[6];
+    out->chip_main = v.d[7] & 0x0fu;
+    out->chip_recv = (v.d[7] >> 4) & 0x0fu;
+    out->gyro_type = v.d[8] & 0x0fu;
+    out->fw_main = rd16be(v.d + 10);
+    out->fw_recv = rd16be(v.d + 12);
+    out->fw_si = rd16be(v.d + 14);
+    out->fw_trigger = rd16be(v.d + 16);
+    out->fw_screen = rd16be(v.d + 18);
+    out->fw_adc = rd16be(v.d + 20);
+    out->fw_sstar = rd16be(v.d + 22);
+    out->features = v.d[24];
     return true;
 }
 
 bool flydigi_rx_sku(const uint8_t *buf, size_t len, uint8_t *value, char out[21])
 {
-    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
-    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x0f) return false;
-    if (!fd_reply_ok(buf, len)) return false;
+    flydigi_reply_view_t v;
+    if (!flydigi_reply_view(buf, len, 0x0f, &v)) return false;
 
-    if (value != NULL) *value = buf[5];
+    if (value != NULL) *value = v.d[0];
     if (out != NULL) {
         unsigned n = 0;
-        for (; n < 20u && buf[6 + n] != 0; n++) {
-            uint8_t const c = buf[6 + n];
+        for (; n < 20u && v.d[1 + n] != 0; n++) {
+            uint8_t const c = v.d[1 + n];
             out[n] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
         }
         out[n] = '\0';
@@ -148,53 +140,33 @@ bool flydigi_rx_sku(const uint8_t *buf, size_t len, uint8_t *value, char out[21]
 bool flydigi_rx_fingerprint(const uint8_t *buf, size_t len, uint8_t *active_slot,
                             uint16_t slot_crc[4], uint16_t *global_crc)
 {
-    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
-    if (buf[0] != 0x5a || buf[1] != 0xa5 ||
-        (buf[2] != 0xa1 && buf[2] != 0xa2)) return false;
-    if (!fd_reply_ok(buf, len)) return false;
+    flydigi_reply_view_t v;
+    /* 0xA1 指纹查询应答 或 0xA2 切槽应答 */
+    if (!flydigi_reply_view(buf, len, 0xa1, &v) &&
+        !flydigi_reply_view(buf, len, 0xa2, &v)) return false;
 
-    if (active_slot != NULL) *active_slot = buf[5];
+    if (active_slot != NULL) *active_slot = v.d[0];
     if (slot_crc != NULL)
-        for (unsigned i = 0; i < 4u; i++) slot_crc[i] = rd16le(buf + 6 + 2 * i);
-    if (global_crc != NULL) *global_crc = rd16le(buf + 14);
+        for (unsigned i = 0; i < 4u; i++) slot_crc[i] = rd16le(v.d + 1 + 2 * i);
+    if (global_crc != NULL) *global_crc = rd16le(v.d + 9);
     return true;
 }
 
 bool flydigi_rx_ram_meta(const uint8_t *buf, size_t len, uint8_t *status, uint8_t *ram_id,
                          uint8_t *slot, uint16_t *data_len, uint32_t *crc32)
 {
-    if (buf == NULL || len < FD_RX_FRAME_BYTES) return false;
-    /* 应答布局（payload 自 [3] 起）：[3]=子操作(1) [4]=status [5]=ramId [6]=槽
-     * [7..8]=长度 u16LE [9..12]=CRC32。子操作 0 为 READ_CHUNK，需排除。 */
-    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0xa3 || buf[3] != 0x01) return false;
-    if (!fd_reply_ok(buf, len)) return false;
+    flydigi_reply_view_t v;
+    /* 应答布局（p 自 [3] 起）：p[0]=子操作(1) p[1]=status p[2]=ramId p[3]=槽
+     * p[4..5]=长度 u16LE p[6..9]=CRC32。子操作 0 为 READ_CHUNK，需排除。 */
+    if (!flydigi_reply_view(buf, len, 0xa3, &v) || v.p[0] != 0x01) return false;
 
-    if (status != NULL) *status = buf[4];
-    if (ram_id != NULL) *ram_id = buf[5];
-    if (slot != NULL) *slot = buf[6];
-    if (data_len != NULL) *data_len = rd16le(buf + 7);
+    if (status != NULL) *status = v.p[1];
+    if (ram_id != NULL) *ram_id = v.p[2];
+    if (slot != NULL) *slot = v.p[3];
+    if (data_len != NULL) *data_len = rd16le(v.p + 4);
     if (crc32 != NULL)
-        *crc32 = (uint32_t)buf[9] | ((uint32_t)buf[10] << 8) |
-                 ((uint32_t)buf[11] << 16) | ((uint32_t)buf[12] << 24);
-    return true;
-}
-
-bool flydigi_rx_hw_status(const uint8_t *buf, size_t len, uint8_t *sleep_minutes,
-                          uint8_t *report_rate, uint8_t *precision,
-                          uint8_t *sensitivity)
-{
-    if (buf == NULL || len < FD_RX_FRAME_BYTES || sleep_minutes == NULL ||
-        report_rate == NULL || precision == NULL || sensitivity == NULL) return false;
-    if (buf[0] != 0x5a || buf[1] != 0xa5 || buf[2] != 0x03) return false;
-
-    uint8_t checksum = 1;
-    for (size_t i = 0; i < FD_RX_FRAME_BYTES - 1; i++) checksum += buf[i];
-    if (checksum != buf[FD_RX_FRAME_BYTES - 1]) return false;
-
-    *sleep_minutes = buf[9];
-    *report_rate = buf[10];
-    *precision = buf[11];
-    *sensitivity = buf[12];
+        *crc32 = (uint32_t)v.p[6] | ((uint32_t)v.p[7] << 8) |
+                 ((uint32_t)v.p[8] << 16) | ((uint32_t)v.p[9] << 24);
     return true;
 }
 
