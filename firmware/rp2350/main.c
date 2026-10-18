@@ -1085,7 +1085,8 @@ static void log_banner(void)
     brg_log("identity: VID=%04x PID=%04x bcdDevice=%04x  HID report=%u B, %u bytes\n",
          BRIDGE_USB_VID, BRIDGE_USB_PID, BRIDGE_USB_BCD,
          (unsigned)sizeof(BRIDGE_GAMEPAD_DESC), VADER2PRO_REPORT_BYTES);
-    brg_log("cmds: i=status q=PIO A=acquire U=release r=resend S=sleep-never 1/2/4/8=rate g=gcfg R=rumble x=raw e=events a=verbose n=reboot b=BOOTSEL\n");
+    brg_log("cmds: i=status q=PIO x=raw e=events a=verbose n=reboot b=BOOTSEL g=gcfg F=info+sku K=fp m=meta\n");
+    brg_log("cmds: c/C=calib w=save Z=reset-global T=3rdparty k#=slot j#=jsres S=sleep 1/2/4/8=rate A/U=acquire r=resend R=rumble\n");
 }
 
 static void log_raw(void)

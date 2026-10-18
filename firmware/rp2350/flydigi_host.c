@@ -50,6 +50,8 @@ static volatile bool s_gcfg_stale;          /* A1 推送：设备端配置已变
 static bool s_fp_awaiting_reply;            /* 刚发过 0xA1 查询（区分应答与推送） */
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
+static uint8_t s_recover_streak;            /* 连续断流恢复次数（输入恢复时归零，用于退避） */
+static uint8_t s_poll_streak;               /* 连续未回应的设备信息轮询数（收到 01 应答归零） */
 static uint8_t s_rumble_left, s_rumble_right;
 static bool s_rumble_pending;
 static uint8_t s_rumble_buf[8];
@@ -223,6 +225,8 @@ static void fd_clear_device_state(void)
     s_acquire_pending = false;
     s_acquire_value = false;
     s_retry_ms = 0;
+    s_recover_streak = 0;
+    s_poll_streak = 0;
     s_rumble_left = 0;
     s_rumble_right = 0;
     s_rumble_deadline_us = 0;
@@ -714,6 +718,7 @@ static void fd_reply_01(const uint8_t *b, uint32_t n)
         g_fd.dev_ext.ex = ex;
         g_fd.dev_ext.valid = true;
         g_fd.dev_ext.replies++;
+        s_poll_streak = 0;              /* 收到 01 应答：轮询退避归零 */
         /* 旧扁平字段由全量解析同步填充（同字节位：model[5]/conn[6]/fw[15..16]）。 */
         g_fd.dev_model = ex.model;
         g_fd.dev_connection = ex.connection;
@@ -940,6 +945,7 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
             critical_section_exit(&s_state_lock);
             g_fd.ext_frames++;
             g_fd.ext_frame_seen = true;
+            s_recover_streak = 0;       /* 输入恢复：重置断流恢复退避 */
             memcpy((void *)g_fd.last_ext_raw, slot->in_buf, FD_RX_FRAME_BYTES);
             /* 拼接帧嫌疑检测（2026-10-18 发现）：接收器偶发把 XInput 载荷拼进
              * EF 帧；错位版被校验拒绝，对齐版会漏过校验。这里只做识别与计数：
@@ -1144,6 +1150,7 @@ static void fd_send_cmds(void)
         /* 兜底 poll：设备信息查询（5a a5 01 02 03，同抓包 poll_cmd），
          * 保持电池/连接信息新鲜（原按需 cmd 03 读取已随死代码移除）。 */
         flydigi_frame_query(s_ex.cmd_buf, 0x01);
+        if (s_poll_streak < 255u) s_poll_streak++;
     }
     if (!usbh_edpt_xfer(s_ex.daddr, s_ex.ep_out, s_ex.cmd_buf, FD_CMD_BYTES)) {
         usbh_edpt_release(s_ex.daddr, s_ex.ep_out);
@@ -1165,8 +1172,12 @@ static void fd_send_cmds(void)
     g_fd.cmds_sent++;
     if (s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         bool const battery_valid = g_fd.battery_valid;
-        s_ex.cmd_next_ms = now_ms() +
-            (battery_valid ? FD_DEVICE_INFO_POLL_MS : FD_DEVICE_INFO_RETRY_MS);
+        /* 设备信息轮询节奏：电池有效 → 5s 常规；否则 500ms 快速重试，但连续
+         * 无应答（手柄离线等）超 ~20s 后退避到 5s，避免 2Hz 空转（每次命令
+         * 还会让接收器 stall ~18ms）。收到 01 应答即归零。 */
+        uint32_t const poll_ms = battery_valid ? FD_DEVICE_INFO_POLL_MS
+            : (s_poll_streak <= 40u ? FD_DEVICE_INFO_RETRY_MS : FD_DEVICE_INFO_POLL_MS);
+        s_ex.cmd_next_ms = now_ms() + poll_ms;
         /* 开机自动读一次全局配置（填充 [CFG]；睡眠非 0 时会在读取完成后自愈） */
         if (!s_gcfg_auto_done) {
             s_gcfg_auto_done = true;
@@ -1225,7 +1236,17 @@ void flydigi_host_task(void)
         (int32_t)(ms - s_retry_ms) >= 0)) {
         s_ex.cmd_idx = 0;
         s_ex.cmd_next_ms = ms + FD_CMD_GAP_MS;
-        s_retry_ms = ms + 2000;
+        /* 断流恢复退避：前两次快速重试（射频瞬断，~2s），持续无输入（手柄关机等）
+         * 则降到 30s 慢速（等于 acquire 保活节奏），避免恢复风暴（实测手柄离线时
+         * 每 ~2s 重启整套启动序列+sent 计数空转）。输入恢复时 streak 归零；
+         * 手动 'r' 重排始终快速且重置退避。 */
+        if (resend_requested) {
+            s_recover_streak = 0;
+            s_retry_ms = ms + 2000u;
+        } else {
+            s_recover_streak++;
+            s_retry_ms = ms + (s_recover_streak > 2 ? 30000u : 2000u);
+        }
         /* 断流恢复后重新声明接管（高帧率流） */
         s_acquire_auto_done = false;
     }
