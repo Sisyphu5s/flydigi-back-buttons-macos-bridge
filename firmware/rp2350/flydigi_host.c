@@ -276,6 +276,7 @@ static void fd_clear_device_state(void)
     g_fd.gcfg_valid = false;
     g_fd.gcfg_reads = 0;
     g_fd.gcfg_errors = 0;
+    g_fd.gcfg_stale_replies = 0;
     g_fd.a0_replies = 0;
     g_fd.a0_last_status = 0;
     g_fd.a0_last_field = 0;
@@ -807,42 +808,53 @@ static void fd_reply_a3(const uint8_t *b)
 {
     if (s_gcfg_active && s_gcfg_waiting) {
         /* v2.1 应答：payload 自 [3] 起 = subop,status,ramId,activeSlot,
-         * totalLen.u16,chunkIdx,chunkSize,data…（官方 core pt/te 布局） */
-        s_gcfg_waiting = false;
+         * totalLen.u16,chunkIdx,chunkSize,data…（官方 core pt/te 布局）。
+         * 健壮性（2026-10-18）：只对“期望块号”做真错误判定；陈旧/重复/越序的
+         * 分块应答（接收器重复转发或上一轮读取的遗留）静默忽略并计数，等待中的
+         * 真应答不受影响；2s 超时是最终兜底。其他子操作（如元数据）不触碰读取状态机。 */
         uint8_t const subop = b[3];
-        uint8_t const status = b[4];
-        uint8_t const cidx = b[9];
-        uint8_t const csize = b[10];
-        if (subop == 0x00 && status == 0 && cidx == s_gcfg_chunk && csize <= 16u) {
-            memcpy(&s_gcfg_buf[(uint32_t)cidx * 16u], &b[11], csize);
-            s_gcfg_last_ms = now_ms();
-            s_gcfg_chunk++;
-            uint32_t const got = (uint32_t)cidx * 16u + csize;
-            if (got >= 82u) {           /* 已覆盖 slice(2,82) 所需 80B 数据 */
-                flydigi_gcfg_t parsed;
-                if (flydigi_gcfg_parse(&s_gcfg_buf[2], &parsed)) {
-                    g_fd.gcfg = parsed;
-                    g_fd.gcfg_valid = true;
-                    g_fd.gcfg_reads++;
-                    /* 自愈：睡眠定时器非 0 → 自动写一次“永不”（每挂载一次） */
-                    if (!s_sleep_auto_done && parsed.sleep_minutes != 0) {
-                        s_sleep_auto_done = true;
-                        flydigi_host_request_field(FD_FIELD_SLEEP, 0);
+        if (subop == 0x00) {
+            uint8_t const status = b[4];
+            uint8_t const cidx = b[9];
+            uint8_t const csize = b[10];
+            if (cidx == s_gcfg_chunk) {
+                if (status == 0 && csize <= 16u) {
+                    s_gcfg_waiting = false;
+                    memcpy(&s_gcfg_buf[(uint32_t)cidx * 16u], &b[11], csize);
+                    s_gcfg_last_ms = now_ms();
+                    s_gcfg_chunk++;
+                    uint32_t const got = (uint32_t)cidx * 16u + csize;
+                    if (got >= 82u) {           /* 已覆盖 slice(2,82) 所需 80B 数据 */
+                        flydigi_gcfg_t parsed;
+                        if (flydigi_gcfg_parse(&s_gcfg_buf[2], &parsed)) {
+                            g_fd.gcfg = parsed;
+                            g_fd.gcfg_valid = true;
+                            g_fd.gcfg_reads++;
+                            /* 自愈：睡眠定时器非 0 → 自动写一次“永不”（每挂载一次） */
+                            if (!s_sleep_auto_done && parsed.sleep_minutes != 0) {
+                                s_sleep_auto_done = true;
+                                flydigi_host_request_field(FD_FIELD_SLEEP, 0);
+                            }
+                        } else {
+                            g_fd.gcfg_errors++;
+                        }
+                        s_gcfg_read_ms = now_ms();
+                        s_gcfg_active = false;
+                    } else if (s_gcfg_chunk >= 6u) {
+                        g_fd.gcfg_errors++;     /* 数据不足 82B */
+                        s_gcfg_read_ms = now_ms();
+                        s_gcfg_active = false;
                     }
                 } else {
-                    g_fd.gcfg_errors++;
+                    s_gcfg_waiting = false;
+                    g_fd.gcfg_errors++;         /* 期望块的错误状态 */
+                    s_gcfg_read_ms = now_ms();
+                    s_gcfg_active = false;
                 }
-                s_gcfg_read_ms = now_ms();
-                s_gcfg_active = false;
-            } else if (s_gcfg_chunk >= 6u) {
-                g_fd.gcfg_errors++;     /* 数据不足 82B */
-                s_gcfg_read_ms = now_ms();
-                s_gcfg_active = false;
+            } else {
+                /* 陈旧/重复/越序分块：忽略（保持 waiting，等真应答或超时）。 */
+                g_fd.gcfg_stale_replies++;
             }
-        } else {
-            g_fd.gcfg_errors++;         /* 错误状态或乱序分块 */
-            s_gcfg_read_ms = now_ms();
-            s_gcfg_active = false;
         }
     }
     if (b[3] == 0x01) {
@@ -1417,6 +1429,10 @@ void flydigi_host_request_thirdparty_restore(void)
 
 void flydigi_host_request_global_config(void)
 {
+    /* 读取进行中则忽略本次请求（在途结果即最新；配置变更推送机制会在
+     * 完成后按需自动补读）。旧实现会无条件重启读取，导致上一轮的
+     * 在途分块应答被判为乱序并 abort+err（2026-10-18 修复）。 */
+    if (s_gcfg_active) return;
     s_gcfg_pending = true;
 }
 

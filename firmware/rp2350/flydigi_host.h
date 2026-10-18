@@ -107,6 +107,7 @@ typedef struct {
     /* 全局配置（0xA3 读 RAM1 → slice(2,82) 的 80B blob，控制台 'g'）。 */
     bool     gcfg_valid;
     uint32_t gcfg_reads, gcfg_errors;
+    uint32_t gcfg_stale_replies;    /* 被忽略的陈旧/重复分块应答计数（健壮性观测） */
     flydigi_gcfg_t gcfg;
 
     /* 官方字段写（0xA0 SetDeviceConfig）应答统计。 */

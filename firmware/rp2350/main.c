@@ -808,8 +808,9 @@ static void log_line_fp(const fd_host_status_t *st)
 
 static void log_line_gltch(const fd_host_status_t *st)
 {
-    brg_log("[GLTCH] zero_imu=%lu splice=%lu sp=%02x%02x%02x%02x\n",
+    brg_log("[GLTCH] zero_imu=%lu splice=%lu stale=%lu sp=%02x%02x%02x%02x\n",
             (unsigned long)st->glitch.zero_imu, (unsigned long)st->glitch.splice,
+            (unsigned long)st->gcfg_stale_replies,
             st->glitch.last_splice_raw[13], st->glitch.last_splice_raw[14],
             st->glitch.last_splice_raw[15], st->glitch.last_splice_raw[16]);
 }
