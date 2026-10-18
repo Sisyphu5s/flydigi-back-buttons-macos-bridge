@@ -101,6 +101,10 @@ typedef struct {
     bool     gcfg_valid;
     uint32_t gcfg_reads, gcfg_errors;
     flydigi_gcfg_t gcfg;
+
+    /* 官方字段写（0xA0 SetDeviceConfig）应答统计。 */
+    uint32_t a0_replies;
+    uint8_t  a0_last_status, a0_last_field;
     uint8_t  rumble_ack_left, rumble_ack_right; /* last successful OUT transfer */
     uint32_t xinput_min_interval_us, xinput_max_interval_us;
     uint32_t ext_min_interval_us, ext_max_interval_us;

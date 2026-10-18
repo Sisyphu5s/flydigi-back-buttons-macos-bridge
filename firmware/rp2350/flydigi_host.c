@@ -196,6 +196,9 @@ static void fd_clear_device_state(void)
     g_fd.gcfg_valid = false;
     g_fd.gcfg_reads = 0;
     g_fd.gcfg_errors = 0;
+    g_fd.a0_replies = 0;
+    g_fd.a0_last_status = 0;
+    g_fd.a0_last_field = 0;
     g_fd.rumble_ack_left = 0;
     g_fd.rumble_ack_right = 0;
     g_fd.ext_frame_seen = false;
@@ -688,6 +691,12 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
                 s_gcfg_active = false;
             }
         }
+        if (slot->in_buf[2] == 0xa0) {
+            /* 官方字段写应答（v1 布局）：5A A5 A0 pkgCount pkgIndex status fieldId CS */
+            g_fd.a0_replies++;
+            g_fd.a0_last_status = slot->in_buf[5];
+            g_fd.a0_last_field = slot->in_buf[6];
+        }
         uint8_t dev_model, dev_connection;
         uint16_t dev_fw;
         if (flydigi_rx_device_info(slot->in_buf, FD_RX_FRAME_BYTES,
@@ -867,19 +876,38 @@ static void fd_send_cmds(void)
         memcpy(s_ex.cmd_buf, acquire_cmd, sizeof acquire_cmd);
         s_ex.cmd_buf[4] = acquire_value ? 1u : 0u;
     } else if (s_sleep_never_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 睡眠定时器置“永不”（0x17，0=从不）：消除 15 分钟空闲休眠掉线循环。
-         * 0x03 在 fw 7.2.2.6 的 USB 路径读不回，写后以命令应答（若有）为准。 */
-        static const uint8_t sleep_cmd[] = { 0x5a, 0xa5, 0x17, 0x03, 0x00, 0x1a };
-        memcpy(s_ex.cmd_buf, sleep_cmd, sizeof sleep_cmd);
-        s_sleep_never_pending = false;
-    } else if (s_rate_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
-        /* 报告率写入（0x14）：{1:1000, 2:500, 4:250, 8:125} Hz（openflydigi 逆向载荷） */
+        /* 睡眠定时器置“永不”：官方路径 = 0xA0 SetDeviceConfig，fieldId=32(0x20)。
+         * 帧：5A A5 A0 04 20 00 CS（CS=Σ[2..n-1]&0xFF） */
         s_ex.cmd_buf[0] = 0x5a;
         s_ex.cmd_buf[1] = 0xa5;
-        s_ex.cmd_buf[2] = 0x14;
-        s_ex.cmd_buf[3] = 0x03;
-        s_ex.cmd_buf[4] = s_rate_value;
-        s_ex.cmd_buf[5] = (uint8_t)(0x14u + 0x03u + s_rate_value);
+        s_ex.cmd_buf[2] = 0xa0;
+        s_ex.cmd_buf[3] = 0x04;
+        s_ex.cmd_buf[4] = 0x20;
+        s_ex.cmd_buf[5] = 0x00;              /* 0 = 永不 */
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 5u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[6] = cs;
+        s_sleep_never_pending = false;
+    } else if (s_rate_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 报告率写入：官方路径 = 0xA0 fieldId=33(0x21)，载荷 u16LE Hz。
+         * 控制台 1/2/4/8 = 1000/500/250/125 Hz。帧：5A A5 A0 05 21 LL HH CS */
+        uint16_t hz = 1000;
+        switch (s_rate_value) {
+        case 2: hz = 500; break;
+        case 4: hz = 250; break;
+        case 8: hz = 125; break;
+        default: hz = 1000; break;
+        }
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0xa0;
+        s_ex.cmd_buf[3] = 0x05;
+        s_ex.cmd_buf[4] = 0x21;
+        s_ex.cmd_buf[5] = (uint8_t)(hz & 0xffu);
+        s_ex.cmd_buf[6] = (uint8_t)(hz >> 8);
+        uint8_t cs = 0;
+        for (unsigned i = 2; i <= 6u; i++) cs = (uint8_t)(cs + s_ex.cmd_buf[i]);
+        s_ex.cmd_buf[7] = cs;
         s_rate_pending = false;
     } else if ((s_gcfg_pending || (s_gcfg_active && !s_gcfg_waiting)) &&
                s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {

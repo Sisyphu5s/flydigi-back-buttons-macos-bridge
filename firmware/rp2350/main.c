@@ -564,6 +564,9 @@ static void log_status(void)
             st.gcfg.report_rate_hz, st.gcfg.sleep_minutes,
             st.gcfg.allow_thirdparty ? 1u : 0u, st.gcfg.js_resolution, st.gcfg.name,
             (unsigned long)st.gcfg_reads, (unsigned long)st.gcfg_errors);
+    /* 官方字段写（0xA0）应答：'S'=field32 睡眠；1/2/4/8=field33 回报率 */
+    brg_log("[A0] replies=%lu status=%u field=%u\n",
+            (unsigned long)st.a0_replies, st.a0_last_status, st.a0_last_field);
     /* 输入新鲜度：接收器回调 → USB 入队的年龄（只在内容变化时采样）。 */
     brg_log("[AGE] input_us last=%lu min=%lu max=%lu n=%lu\n",
             (unsigned long)s_bridge_age_last_us, (unsigned long)s_bridge_age_min_us,
