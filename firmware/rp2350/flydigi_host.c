@@ -38,6 +38,8 @@ static volatile bool s_hwinfo_pending;      /* 按需发送 cmd 03（硬件状�
 static bool s_hwinfo_auto_done;             /* 开机后自动补发只做一次 */
 static bool s_acquire_auto_done;            /* 开机自动声明接管（高帧率流）只做一次 */
 static volatile bool s_sleep_never_pending; /* 按需发送 cmd 17（睡眠=永不） */
+static volatile bool s_rate_pending;        /* 按需发送 cmd 14（报告率） */
+static volatile uint8_t s_rate_value;       /* {1:1000, 2:500, 4:250, 8:125} Hz */
 static uint32_t s_acquire_keepalive_ms;     /* 上次 acquire 发送时刻（30s 保活） */
 static bool s_acquire_pending, s_acquire_value;
 static uint32_t s_retry_ms;
@@ -181,6 +183,7 @@ static void fd_clear_device_state(void)
     s_hwinfo_auto_done = false;
     s_acquire_auto_done = false;
     s_sleep_never_pending = false;
+    s_rate_pending = false;
     g_fd.rumble_ack_left = 0;
     g_fd.rumble_ack_right = 0;
     g_fd.ext_frame_seen = false;
@@ -804,8 +807,8 @@ static void fd_send_cmds(void)
     acquire_pending = s_acquire_pending;
     acquire_value = s_acquire_value;
     critical_section_exit(&s_state_lock);
-    if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_never_pending) ||
-        s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
+    if ((!acquire_pending && !s_hwinfo_pending && !s_sleep_never_pending &&
+         !s_rate_pending) || s_ex.cmd_idx < FD_STARTUP_CMD_COUNT) {
         if ((int32_t)(now_ms() - s_ex.cmd_next_ms) < 0) return;
     }
     if (!usbh_edpt_claim(s_ex.daddr, s_ex.ep_out)) { g_fd.cmd_claim_fail++; return; }
@@ -823,6 +826,15 @@ static void fd_send_cmds(void)
         static const uint8_t sleep_cmd[] = { 0x5a, 0xa5, 0x17, 0x03, 0x00, 0x1a };
         memcpy(s_ex.cmd_buf, sleep_cmd, sizeof sleep_cmd);
         s_sleep_never_pending = false;
+    } else if (s_rate_pending && s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
+        /* 报告率写入（0x14）：{1:1000, 2:500, 4:250, 8:125} Hz（openflydigi 逆向载荷） */
+        s_ex.cmd_buf[0] = 0x5a;
+        s_ex.cmd_buf[1] = 0xa5;
+        s_ex.cmd_buf[2] = 0x14;
+        s_ex.cmd_buf[3] = 0x03;
+        s_ex.cmd_buf[4] = s_rate_value;
+        s_ex.cmd_buf[5] = (uint8_t)(0x14u + 0x03u + s_rate_value);
+        s_rate_pending = false;
     } else if (s_ex.cmd_idx >= FD_STARTUP_CMD_COUNT) {
         if (s_hwinfo_pending) {
             /* 按需读硬件状态（cmd 03）：睡眠分钟/报告率/摇杆精度与灵敏度 */
@@ -1008,6 +1020,12 @@ void flydigi_host_request_hw_status(void)
 void flydigi_host_request_sleep_never(void)
 {
     s_sleep_never_pending = true;
+}
+
+void flydigi_host_request_report_rate(uint8_t value)
+{
+    s_rate_value = value;
+    s_rate_pending = true;
 }
 
 void flydigi_host_acquire_probe(bool acquire)

@@ -156,6 +156,9 @@ void flydigi_host_request_hw_status(void);
 /* 把睡眠定时器置为“永不”（控制台 'S'，cmd 17）= 消除 15 分钟空闲休眠掉线循环 */
 void flydigi_host_request_sleep_never(void);
 
+/* 写入报告率（控制台 1/2/4/8，cmd 14）：{1:1000, 2:500, 4:250, 8:125} Hz */
+void flydigi_host_request_report_rate(uint8_t value);
+
 /* One-shot SDL-style acquire/release probe on the receiver's command endpoint. */
 void flydigi_host_acquire_probe(bool acquire);
 
