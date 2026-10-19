@@ -130,6 +130,7 @@ typedef struct {
     uint32_t xi_reports_rejected;
     uint32_t xinput_spikes_filtered;
     uint32_t ext_poll_submit, ext_poll_claim_fail, ext_poll_xfer_fail;
+    uint32_t ext_poll_heals;       /* ext IN 完成静默 >5s 时的 abort 重提次数（楔子自愈） */
     uint32_t ext_xfer_cb, ext_xfer_ok, ext_out_xfer_ok;
     uint32_t cmd_claim_fail, cmd_xfer_fail;
     bool     xi_in_flight, ext_in_flight;

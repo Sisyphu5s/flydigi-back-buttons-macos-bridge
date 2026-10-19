@@ -199,6 +199,8 @@ typedef struct {
     uint16_t ep_in_size;
     bool     in_flight;
     uint32_t next_poll_us;
+    uint32_t last_done_ms;         /* 最近一次成功完成时刻（IN 楔子自愈基准） */
+    uint32_t heal_next_ms;         /* 下一次楔子自愈冷却 */
     /* Keep the full packet-sized buffer; useful reports are 32 bytes. */
     uint8_t  in_buf[64];
 } fd_ext_in_t;
@@ -555,6 +557,8 @@ static bool fd_ex_open(uint8_t rhport, uint8_t dev_addr, tusb_desc_interface_t c
     slot->ep_in_size = in_size;
     slot->in_flight = false;
     slot->next_poll_us = now_us();
+    slot->last_done_ms = 0;                    /* 楔子自愈基准：重挂载后从零开始 */
+    slot->heal_next_ms = 0;
     if (g_fd.ext_ep_in == 0 || ep_out != 0) {
         g_fd.ext_ep_in = ep_in;
         g_fd.ext_ep_in_size = in_size;
@@ -726,11 +730,18 @@ static void fd_reply_01(const uint8_t *b, uint32_t n)
          * 重置恢复退避并立即安排一次快速恢复（重发启动序列 test-mode + acquire），
          * 同时补一次配置重读。避免退避到 30s 后手柄回归要等半分钟才恢复 EF。 */
         uint32_t const now = now_ms();
-        if (s_dev_info_last_ms != 0 &&
+        /* 手柄回归检测（2026-10-19 二轮）：首次应答（含开机后才上线）或长时间无
+         * 01 后重新收到 → 退避归零并立即安排快速恢复；同时直接补发一次 acquire，
+         * 不必再等 30s 保活，让高帧率流尽快恢复（实测 ~7s → 可再缩短）。 */
+        if (s_dev_info_last_ms == 0 ||
             (int32_t)(now - s_dev_info_last_ms) > 10000) {
             s_recover_streak = 0;
             s_retry_ms = 0;
             s_gcfg_stale = true;
+            critical_section_enter_blocking(&s_state_lock);
+            s_acquire_value = true;
+            s_acquire_pending = true;
+            critical_section_exit(&s_state_lock);
         }
         s_dev_info_last_ms = now;
         /* 旧扁平字段由全量解析同步填充（同字节位：model[5]/conn[6]/fw[15..16]）。 */
@@ -916,7 +927,10 @@ static bool fd_ex_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t resul
     }
     if (slot == NULL) return true;
     slot->in_flight = false;
-    if (result == XFER_RESULT_SUCCESS) g_fd.ext_xfer_ok++;
+    if (result == XFER_RESULT_SUCCESS) {
+        g_fd.ext_xfer_ok++;
+        slot->last_done_ms = now_ms();
+    }
     g_fd.ext_in_flight = false;
     if (result != XFER_RESULT_SUCCESS) return true;
 
@@ -1250,16 +1264,30 @@ void flydigi_host_task(void)
         (int32_t)(ms - s_retry_ms) >= 0)) {
         s_ex.cmd_idx = 0;
         s_ex.cmd_next_ms = ms + FD_CMD_GAP_MS;
-        /* 断流恢复退避：前两次快速重试（射频瞬断，~2s），持续无输入（手柄关机等）
-         * 则降到 30s 慢速（等于 acquire 保活节奏），避免恢复风暴（实测手柄离线时
-         * 每 ~2s 重启整套启动序列+sent 计数空转）。输入恢复时 streak 归零；
-         * 手动 'r' 重排始终快速且重置退避。 */
+        /* 断流恢复退避（2026-10-19 二轮：手柄在场感知）：
+         * - 手柄在场（最近 60s 内有 01 应答）：射频瞬断为主，保持快重试
+         *   （2s,2s,4s,4s,8s 封顶），避免旧版第 3 次即跳 30s 造成"断几十秒"。
+         * - 手柄不在场（接收器无应答）：维持 2s,2s,30s… 慢速，避免恢复风暴
+         *   （离线时每 2s 重放整套启动序列空转）。输入恢复或 01 回归时
+         *   streak 归零；手动 'r' 重排始终快速并重置退避。 */
         if (resend_requested) {
             s_recover_streak = 0;
             s_retry_ms = ms + 2000u;
         } else {
+            bool const pad_present = s_dev_info_last_ms != 0 &&
+                (int32_t)(ms - s_dev_info_last_ms) <= 60000;
+            uint32_t next_ms;
+            if (!pad_present) {
+                next_ms = s_recover_streak >= 2 ? 30000u : 2000u;
+            } else if (s_recover_streak < 2) {
+                next_ms = 2000u;
+            } else if (s_recover_streak < 4) {
+                next_ms = 4000u;
+            } else {
+                next_ms = 8000u;
+            }
             s_recover_streak++;
-            s_retry_ms = ms + (s_recover_streak > 2 ? 30000u : 2000u);
+            s_retry_ms = ms + next_ms;
         }
         /* 断流恢复后重新声明接管（高帧率流） */
         s_acquire_auto_done = false;
@@ -1322,6 +1350,21 @@ void flydigi_host_task(void)
                        &slot->in_flight, &slot->next_poll_us,
                        &g_fd.ext_poll_submit, &g_fd.ext_poll_claim_fail,
                        &g_fd.ext_poll_xfer_fail, &g_fd.ext_in_flight);
+        }
+        /* IN 楔子自愈（2026-10-19）：端点此前有成功完成、随后 >5s 完全静默且
+         * 在途 IN 仍挂着 —— 疑似主机控制器丢失完成（上午"总线软复位唤不醒、
+         * 拔插才恢复"的可自愈形态）。abort 让 xfer_cb 以失败收尾，下一 tick
+         * 自然重提。仅"最近 90s 内曾有完成"（活跃楔子）时动作，冷却 10s；
+         * 空闲/无手柄时不触发，超窗后自然停手。 */
+        for (uint8_t i = 0; i < s_ex.in_count; i++) {
+            fd_ext_in_t *slot = &s_ex.in[i];
+            if (!slot->in_flight || slot->last_done_ms == 0) continue;
+            uint32_t const gap_ms = ms - slot->last_done_ms;
+            if ((int32_t)gap_ms >= 5000 && (int32_t)gap_ms <= 90000 &&
+                (int32_t)(ms - slot->heal_next_ms) >= 0) {
+                if (tuh_edpt_abort_xfer(s_ex.daddr, slot->ep_in)) g_fd.ext_poll_heals++;
+                slot->heal_next_ms = ms + 10000u;
+            }
         }
     }
     critical_section_enter_blocking(&s_state_lock);

@@ -907,7 +907,7 @@ static void log_status(void)
             st.ext_trace_out_ep[1], st.ext_trace_out_size[1],
             st.ext_trace_itf[2], st.ext_trace_in_ep[2], st.ext_trace_in_size[2],
             st.ext_trace_out_ep[2], st.ext_trace_out_size[2]);
-    brg_log("[XFER] xi sub=%lu claim=%lu fail=%lu cb=%lu ok=%lu reject=%lu busy=%d | ext sub=%lu claim=%lu fail=%lu cb=%lu ok=%lu out=%lu busy=%d | cmd claim=%lu fail=%lu\n",
+    brg_log("[XFER] xi sub=%lu claim=%lu fail=%lu cb=%lu ok=%lu reject=%lu busy=%d | ext sub=%lu claim=%lu fail=%lu cb=%lu ok=%lu out=%lu busy=%d heal=%lu | cmd claim=%lu fail=%lu\n",
             (unsigned long)st.xi_poll_submit, (unsigned long)st.xi_poll_claim_fail,
             (unsigned long)st.xi_poll_xfer_fail, (unsigned long)st.xi_xfer_cb,
             (unsigned long)st.xi_xfer_ok, (unsigned long)st.xi_reports_rejected,
@@ -915,7 +915,8 @@ static void log_status(void)
             (unsigned long)st.ext_poll_submit, (unsigned long)st.ext_poll_claim_fail,
             (unsigned long)st.ext_poll_xfer_fail, (unsigned long)st.ext_xfer_cb,
             (unsigned long)st.ext_xfer_ok, (unsigned long)st.ext_out_xfer_ok,
-            (int)st.ext_in_flight, (unsigned long)st.cmd_claim_fail,
+            (int)st.ext_in_flight, (unsigned long)st.ext_poll_heals,
+            (unsigned long)st.cmd_claim_fail,
             (unsigned long)st.cmd_xfer_fail);
     brg_log("[IDLE] sent=%lu queuefail=%lu done=%lu last=%u result=%u\n",
             (unsigned long)st.hid_idle_sent, (unsigned long)st.hid_idle_queue_fail,
